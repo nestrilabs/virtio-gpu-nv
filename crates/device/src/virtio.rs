@@ -17,6 +17,7 @@
 //   - Writable descriptors = response buffer.
 
 use crate::nvidia::NvidiaBackend;
+use crate::shm::ZoneConfig;
 
 // ---------------------------------------------------------------------------
 // Virtio descriptor (as seen by the backend after GPA→HVA translation)
@@ -77,19 +78,35 @@ pub struct NvidiaDevice {
 }
 
 impl NvidiaDevice {
-    pub fn new(shm_bar_size: u64) -> Self {
+    /// Create with an explicit zone configuration.
+    /// libkrun passes this in after reading the BAR size from VM config.
+    pub fn new(cfg: ZoneConfig) -> Self {
         Self {
-            backend: NvidiaBackend::new(shm_bar_size),
+            backend: NvidiaBackend::new(cfg),
+        }
+    }
+
+    /// Create with the default 256 MiB zone split.
+    /// Convenience constructor for tests and simple integrations.
+    pub fn with_default_zones() -> Self {
+        Self {
+            backend: NvidiaBackend::with_default_zones(),
         }
     }
 
     /// Run the device loop using the provided virtio transport.
     ///
     /// Blocks indefinitely; call from a dedicated thread.
+    /// Call `teardown()` after this returns (or on SIGTERM) to close host fds.
     pub fn run<V: VirtioDevice>(&mut self, mut transport: V) {
         loop {
             let backend = &mut self.backend;
             transport.process_queue(|req, resp| backend.dispatch(req, resp));
         }
+    }
+
+    /// Close all host file descriptors. Call on VM shutdown or crash.
+    pub fn teardown(&mut self) {
+        self.backend.teardown();
     }
 }

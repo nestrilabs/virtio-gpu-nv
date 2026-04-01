@@ -3,16 +3,37 @@
  * virtio_gpu_nv_ioctl.c — file operations: open, release, ioctl
  *
  * open():
- *   Sends NV_MSG_OPEN to the backend, receives a guest_handle, stores it in
- *   file->private_data.
+ *   Sends NV_MSG_OPEN to the backend, receives a guest_handle, stores it
+ *   in file->private_data.
  *
  * release():
  *   Sends NV_MSG_CLOSE to the backend.
  *
  * ioctl():
  *   Copies the raw ioctl param bytes from userspace, sends NV_MSG_IOCTL,
- *   waits for the response, copies updated bytes back.  NOT ABI-aware —
- *   the guest driver forwards raw bytes; the backend does all interpretation.
+ *   waits for the response, copies updated bytes back.
+ *
+ * --- On "NOT ABI-aware" ---
+ *
+ * The guest driver does not parse or interpret any NVIDIA ioctl struct
+ * fields.  All semantic logic (handle translation, struct layout,
+ * nested-dispatch) lives in the backend.
+ *
+ * However, the guest driver does use _IOC_SIZE(cmd) to determine how many
+ * bytes to copy_from_user / copy_to_user.  This means the ioctl numbers
+ * in the user-mode library must encode the correct size for the driver
+ * version running on the HOST — because the host backend is the one that
+ * actually interprets those bytes.
+ *
+ * In practice this is always true: the user-mode NVIDIA libraries are
+ * version-locked to the kernel driver, and both run at the host's version.
+ * The guest's copy of libcuda/libvulkan_nvidia is the same binary as on
+ * the host (or the same version), so _IOC_SIZE values match.
+ *
+ * If you ever load a different-version user-mode library in the guest, the
+ * backend will catch the mismatch via NV_ESC_CHECK_VERSION_STR and return
+ * an error before any struct is misinterpreted.  We do NOT need to validate
+ * _IOC_SIZE in the guest driver beyond the NV_MAX_PARAM_SIZE safety cap.
  *
  * mmap() is in virtio_gpu_nv_mmap.c.
  */
@@ -53,7 +74,6 @@ static int nv_open(struct inode *inode, struct file *filp) {
 
   ctx->dev = ndev;
 
-  /* Determine device kind from minor. */
   memset(&req_payload, 0, sizeof(req_payload));
   if (ncdev->minor == MINOR_CTL) {
     req_payload.kind = NV_DEV_CTL;
@@ -120,13 +140,11 @@ static int nv_release(struct inode *inode, struct file *filp) {
 
   ret = nv_do_request(ndev, &req_hdr, sizeof(req_hdr), &req_payload,
                       sizeof(req_payload), &resp);
-  if (ret) {
+  if (ret)
     pr_warn("nv_release: nv_do_request failed: %d\n", ret);
-    /* Fall through — still free ctx. */
-  } else if (le32_to_cpu(resp.resp_hdr.status) != NV_STATUS_OK) {
+  else if (le32_to_cpu(resp.resp_hdr.status) != NV_STATUS_OK)
     pr_warn("nv_release: backend status %u\n",
             le32_to_cpu(resp.resp_hdr.status));
-  }
 
   kfree(ctx);
   filp->private_data = NULL;
@@ -136,12 +154,8 @@ static int nv_release(struct inode *inode, struct file *filp) {
 /* -------------------------------------------------------------------------
  * nv_ioctl — forward raw ioctl bytes to the backend
  *
- * The guest driver is deliberately NOT ABI-aware.  It:
- *   1. Reads _IOC_SIZE(cmd) bytes from userspace.
- *   2. Sends them to the backend (which is ABI-aware).
- *   3. Copies the (possibly modified) bytes back.
- *
- * The backend returns the updated param bytes alongside the response header.
+ * Size source: _IOC_SIZE(cmd) — the size encoded by the user-mode library
+ * in the ioctl number.  See the file-level comment for why this is correct.
  * ---------------------------------------------------------------------- */
 
 long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
@@ -149,7 +163,6 @@ long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
   struct nv_dev *ndev = ctx->dev;
   unsigned int param_size = _IOC_SIZE(cmd);
 
-  /* Stack-allocated request: msg_header + ioctl_req + param bytes. */
   struct {
     struct msg_header req_hdr;
     struct ioctl_req ioctl_hdr;
@@ -174,11 +187,6 @@ long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
     }
   }
 
-  /* Build the IOCTL request.
-   * We send: [msg_header][ioctl_req][raw param bytes]
-   * as a two-part payload: the fixed headers as req_hdr, the param
-   * bytes as req_payload.  nv_do_request() concatenates them. */
-
   req.req_hdr.msg_type = cpu_to_le32(NV_MSG_IOCTL);
   req.req_hdr.cookie = cpu_to_le64(next_cookie(ndev));
   req.req_hdr._pad = 0;
@@ -188,15 +196,11 @@ long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
   req.ioctl_hdr.param_size = cpu_to_le32(param_size);
   req.ioctl_hdr._pad = 0;
 
-  /* We need to send [req_hdr + ioctl_req] as a single readable region
-   * followed by [param bytes].  nv_do_request takes exactly two regions,
-   * so pass the full fixed part as req_hdr and param_buf as req_payload. */
   ret = nv_do_request(ndev, &req, sizeof(req), param_buf, param_size, &resp);
   if (ret)
     goto out;
 
   if (le32_to_cpu(resp.resp_hdr.status) != NV_STATUS_OK) {
-    /* Translate backend status to an appropriate errno. */
     int host_errno = le32_to_cpu(resp.resp_hdr.errno_host);
     ret = host_errno ? -host_errno : -EIO;
     goto out;
@@ -209,7 +213,6 @@ long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 
   iresp = (struct ioctl_resp *)resp.resp_payload;
 
-  /* Copy updated param bytes back to userspace. */
   if (param_size && iresp->param_size) {
     u32 copy_len = min_t(u32, param_size, le32_to_cpu(iresp->param_size));
     void *resp_params = (char *)resp.resp_payload + sizeof(struct ioctl_resp);
@@ -231,9 +234,6 @@ out:
  * ---------------------------------------------------------------------- */
 
 static __poll_t nv_poll(struct file *filp, struct poll_table_struct *wait) {
-  /* Always report ready for now; NVIDIA user-mode libs will query
-   * GPU events via NV_ESC_ALLOC_OS_EVENT/NV_ESC_FREE_OS_EVENT in
-   * Phase 4. */
   return EPOLLIN | EPOLLOUT;
 }
 

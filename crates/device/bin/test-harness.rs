@@ -1,24 +1,6 @@
-// crates/device/src/bin/test_harness.rs
-//
-// Minimal test harness for local Phase 1/2 development.
-//
-// Implements a simple loopback transport over a Unix socket:
-// the harness listens for raw request buffers, calls NvidiaBackend::dispatch(),
-// and writes the response back.
-//
-// This is NOT a real vhost-user implementation — it is a straight-line
-// request/response loop so we can iterate on the backend without a VM.
-// To use it:
-//
-//   Terminal 1:  cargo run --bin test-harness [--mock] [--socket /tmp/nv-vhost.sock]
-//   Terminal 2:  socat - UNIX-CONNECT:/tmp/nv-vhost.sock (or use the test client)
-//
-// With --mock, the harness opens /dev/null instead of /dev/nvidiactl, so
-// no NVIDIA GPU is required.  Ioctls will fail with EBADF but open/close
-// round-trips work.
-
 use clap::Parser;
 use device::nvidia::NvidiaBackend;
+use device::shm::ZoneConfig;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -34,10 +16,12 @@ struct Args {
     /// Mock mode, opens /dev/null instead of /dev/nvidiactl
     #[arg(long, default_value_t = false)]
     mock: bool,
+
     /// Socket path to listen on
     #[arg(long, default_value = "/tmp/nv-vhost.sock")]
     socket_path: String,
-    /// SHM size
+
+    /// Total SHM BAR size in bytes (split: 4 MiB UC, half WC, rest WB)
     #[arg(long, default_value_t = 256 * 1024 * 1024)]
     shm_size: u64,
 }
@@ -53,51 +37,67 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+
     if args.mock {
         tracing::warn!("mock mode: GPU ioctls will fail with EBADF");
     }
 
-    // Remove stale socket file
+    // Remove stale socket file.
     let _ = std::fs::remove_file(&args.socket_path);
     let listener = UnixListener::bind(&args.socket_path)
         .unwrap_or_else(|e| panic!("bind {:?}: {}", args.socket_path, e));
 
     tracing::info!("listening on {:?}", args.socket_path);
 
-    let backend = Arc::new(Mutex::new(NvidiaBackend::new(args.shm_size)));
+    // Build ZoneConfig from the flat shm_size:
+    //   4 MiB  → UC  (control registers, doorbells)
+    //   half   → WC  (VRAM / framebuffer)
+    //   rest   → WB  (DMA buffers)
+    let uc = 4 * 1024 * 1024u64;
+    let remaining = args.shm_size.saturating_sub(uc);
+    let wc = remaining / 2;
+    let wb = remaining - wc;
+    let cfg = ZoneConfig {
+        uc_size: uc,
+        wc_size: wc,
+        wb_size: wb,
+    };
+
+    let backend = Arc::new(Mutex::new(NvidiaBackend::new(cfg)));
+
     loop {
         tokio::select! {
-            // Accept new connections asynchronously
+            // Accept new connections asynchronously.
             accept_res = listener.accept() => {
                 match accept_res {
                     Ok((mut conn, _addr)) => {
                         tracing::info!("client connected");
                         let backend_clone = backend.clone();
 
-                        // Spawn a new task per connection to prevent blocking the accept loop
+                        // Spawn a new task per connection to prevent blocking the accept loop.
                         tokio::spawn(async move {
                             loop {
-                                // Read 4-byte length prefix
+                                // Read 4-byte length prefix.
                                 let mut len_buf = [0u8; 4];
                                 if conn.read_exact(&mut len_buf).await.is_err() {
                                     break;
                                 }
                                 let req_len = u32::from_le_bytes(len_buf) as usize;
 
-                                // Read request body
+                                // Read request body.
                                 let mut req = vec![0u8; req_len];
                                 if conn.read_exact(&mut req).await.is_err() {
                                     break;
                                 }
 
-                                // Dispatch
+                                // Dispatch.
                                 let mut resp = vec![0u8; 8192];
                                 let resp_len = {
                                     let mut b = backend_clone.lock().await;
                                     b.dispatch(&req, &mut resp)
                                 };
 
-                                // Write length-prefixed response
+                                // Write length-prefixed response.
                                 let prefix = (resp_len as u32).to_le_bytes();
                                 if conn.write_all(&prefix).await.is_err() {
                                     break;
@@ -106,6 +106,11 @@ async fn main() -> anyhow::Result<()> {
                                     break;
                                 }
                             }
+
+                            // Close all host fds associated with this client's handles.
+                            // This covers the ungraceful disconnect case — the guest
+                            // process died without sending NV_MSG_CLOSE for each fd.
+                            backend_clone.lock().await.teardown();
                             tracing::info!("client disconnected");
                         });
                     }
@@ -113,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Listen for Ctrl-C signal
+            // Listen for Ctrl-C signal.
             _ = tokio::signal::ctrl_c() => {
                 break;
             }
@@ -122,7 +127,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("exiting cleanly");
 
-    // Cleanup
+    // Final teardown: close any fds that slipped through (e.g. in-flight
+    // connections that hadn't disconnected yet when Ctrl-C arrived).
+    backend.lock().await.teardown();
+
+    // Remove socket file so a re-run doesn't need --force.
     let _ = std::fs::remove_file(&args.socket_path);
 
     Ok(())
