@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod handle_table;
+pub mod mmap;
 pub mod nvidia;
 pub mod shm;
 pub mod virtio;
