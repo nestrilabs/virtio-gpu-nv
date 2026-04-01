@@ -12,5 +12,8 @@ log       = "0.4"
 libc      = "0.2"
 thiserror = "1"
 
-[dev-dependencies]
 env_logger = "0.11"
+
+[[bin]]
+name = "test-harness"
+path = "src/bin/test_harness.rs"

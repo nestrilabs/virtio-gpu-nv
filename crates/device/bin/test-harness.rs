@@ -1,4 +1,4 @@
-// crates/device/examples/test_harness.rs
+// crates/device/src/bin/test_harness.rs
 //
 // Minimal test harness for local Phase 1/2 development.
 //
@@ -10,7 +10,7 @@
 // request/response loop so we can iterate on the backend without a VM.
 // To use it:
 //
-//   Terminal 1:  cargo run --example test_harness -- [--mock] [--socket /tmp/nv.sock]
+//   Terminal 1:  cargo run --bin test-harness [--mock] [--socket /tmp/nv.sock]
 //   Terminal 2:  socat - UNIX-CONNECT:/tmp/nv.sock   (or use the test client)
 //
 // With --mock, the harness opens /dev/null instead of /dev/nvidiactl, so
