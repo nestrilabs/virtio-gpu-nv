@@ -1,4 +1,4 @@
-// crates/device/src/test/test_harness.rs
+// crates/device/examples/test_harness.rs
 //
 // Minimal test harness for local Phase 1/2 development.
 //
