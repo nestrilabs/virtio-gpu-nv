@@ -27,11 +27,11 @@ impl NvStatus {
 }
 
 /// 64-bit GPU virtual address (returned by mapping operations).
-pub type NvP64   = u64;
+pub type NvP64 = u64;
 /// GPU device memory address.
-pub type NvU64   = u64;
-pub type NvU32   = u32;
-pub type NvU16   = u16;
-pub type NvU8    = u8;
-pub type NvBool  = u8;
-pub type NvS32   = i32;
+pub type NvU64 = u64;
+pub type NvU32 = u32;
+pub type NvU16 = u16;
+pub type NvU8 = u8;
+pub type NvBool = u8;
+pub type NvS32 = i32;

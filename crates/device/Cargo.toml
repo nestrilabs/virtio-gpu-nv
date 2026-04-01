@@ -10,10 +10,14 @@ abi      = { workspace = true }
 
 log       = "0.4"
 libc      = "0.2"
-thiserror = "1"
+thiserror = "2"
+anyhow = "1"
 
-env_logger = "0.11"
+tokio = { version = "1.50", features = ["full"] }
+clap = { version = "4.6", features = ["derive", "string"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[bin]]
 name = "test-harness"
-path = "src/bin/test_harness.rs"
+path = "bin/test-harness.rs"

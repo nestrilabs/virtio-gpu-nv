@@ -16,7 +16,11 @@ pub struct DriverVersion {
 
 impl DriverVersion {
     pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
-        Self { major, minor, patch }
+        Self {
+            major,
+            minor,
+            patch,
+        }
     }
 
     /// Parse from the string returned by `NV_ESC_CHECK_VERSION_STR`.
@@ -26,7 +30,11 @@ impl DriverVersion {
         let major = parts.next()?.parse().ok()?;
         let minor = parts.next()?.parse().ok()?;
         let patch = parts.next()?.parse().ok()?;
-        Some(Self { major, minor, patch })
+        Some(Self {
+            major,
+            minor,
+            patch,
+        })
     }
 }
 

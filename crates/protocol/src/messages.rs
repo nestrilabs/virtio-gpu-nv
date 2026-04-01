@@ -214,12 +214,12 @@ pub struct IoctlResp {
 // These catch accidental padding changes that would break the C header.
 
 const _: () = {
-    assert!(core::mem::size_of::<MsgHeader>() == 16);
-    assert!(core::mem::size_of::<RespHeader>() == 16);
-    assert!(core::mem::size_of::<OpenReq>() == 8);
-    assert!(core::mem::size_of::<OpenResp>() == 8);
-    assert!(core::mem::size_of::<CloseReq>() == 8);
-    assert!(core::mem::size_of::<CloseResp>() == 8);
-    assert!(core::mem::size_of::<IoctlReq>() == 24);
-    assert!(core::mem::size_of::<IoctlResp>() == 32);
+    assert!(size_of::<MsgHeader>() == 16);
+    assert!(size_of::<RespHeader>() == 16);
+    assert!(size_of::<OpenReq>() == 8);
+    assert!(size_of::<OpenResp>() == 8);
+    assert!(size_of::<CloseReq>() == 8);
+    assert!(size_of::<CloseResp>() == 8);
+    assert!(size_of::<IoctlReq>() == 24);
+    assert!(size_of::<IoctlResp>() == 32);
 };

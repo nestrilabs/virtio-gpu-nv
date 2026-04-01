@@ -7,7 +7,7 @@
 // so a stale handle from a crashed guest can't accidentally alias a new one.
 
 use std::collections::HashMap;
-use std::os::fd::{OwnedFd, RawFd, AsRawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use crate::error::{DeviceError, Result};
 
@@ -21,7 +21,7 @@ pub struct HandleTable {
 impl HandleTable {
     pub fn new() -> Self {
         Self {
-            next: 1,   // 0 is reserved as the null/invalid handle
+            next: 1, // 0 is reserved as the null/invalid handle
             table: HashMap::new(),
         }
     }

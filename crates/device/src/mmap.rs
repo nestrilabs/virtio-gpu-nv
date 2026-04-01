@@ -28,7 +28,9 @@ pub struct MmapContext {
 
 impl MmapContext {
     pub fn new() -> Self {
-        Self { entries: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+        }
     }
 
     pub fn insert(&mut self, entry: MmapEntry) {
@@ -45,5 +47,7 @@ impl MmapContext {
 }
 
 impl Default for MmapContext {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

@@ -25,7 +25,7 @@ use crate::nvidia::NvidiaBackend;
 /// A single scatter-gather entry after the VMM has resolved guest physical
 /// addresses to host virtual addresses.
 pub struct Descriptor<'a> {
-    pub data:     &'a [u8],
+    pub data: &'a [u8],
     pub writable: bool,
 }
 

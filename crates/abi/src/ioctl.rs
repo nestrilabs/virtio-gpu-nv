@@ -9,29 +9,30 @@
 // ---------------------------------------------------------------------------
 // /dev/nvidiactl and /dev/nvidia# ioctl numbers
 // ---------------------------------------------------------------------------
+#![allow(non_snake_case)]
 
-pub const NV_ESC_CARD_INFO:              u32 = 0x01;
-pub const NV_ESC_CHECK_VERSION_STR:      u32 = 0x25;
-pub const NV_ESC_REGISTER_FD:            u32 = 0x2A;
-pub const NV_ESC_ALLOC_OS_EVENT:         u32 = 0x2C;
-pub const NV_ESC_FREE_OS_EVENT:          u32 = 0x2D;
-pub const NV_ESC_STATUS_CODE:            u32 = 0x30;
-pub const NV_ESC_RM_ALLOC_MEMORY:        u32 = 0x52;
-pub const NV_ESC_RM_FREE:                u32 = 0x53;
-pub const NV_ESC_RM_CONTROL:             u32 = 0x54;
-pub const NV_ESC_RM_ALLOC:              u32 = 0x55;
-pub const NV_ESC_RM_DUP_OBJECT:         u32 = 0x56;
-pub const NV_ESC_RM_SHARE:              u32 = 0x57;
-pub const NV_ESC_RM_MAP_MEMORY:         u32 = 0x4E;
-pub const NV_ESC_RM_UNMAP_MEMORY:       u32 = 0x4F;
+pub const NV_ESC_CARD_INFO: u32 = 0x01;
+pub const NV_ESC_CHECK_VERSION_STR: u32 = 0x25;
+pub const NV_ESC_REGISTER_FD: u32 = 0x2A;
+pub const NV_ESC_ALLOC_OS_EVENT: u32 = 0x2C;
+pub const NV_ESC_FREE_OS_EVENT: u32 = 0x2D;
+pub const NV_ESC_STATUS_CODE: u32 = 0x30;
+pub const NV_ESC_RM_ALLOC_MEMORY: u32 = 0x52;
+pub const NV_ESC_RM_FREE: u32 = 0x53;
+pub const NV_ESC_RM_CONTROL: u32 = 0x54;
+pub const NV_ESC_RM_ALLOC: u32 = 0x55;
+pub const NV_ESC_RM_DUP_OBJECT: u32 = 0x56;
+pub const NV_ESC_RM_SHARE: u32 = 0x57;
+pub const NV_ESC_RM_MAP_MEMORY: u32 = 0x4E;
+pub const NV_ESC_RM_UNMAP_MEMORY: u32 = 0x4F;
 pub const NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO: u32 = 0x5E;
 
 // ---------------------------------------------------------------------------
 // /dev/nvidia-uvm ioctl numbers  (Phase 4)
 // ---------------------------------------------------------------------------
 
-pub const UVM_INITIALIZE:               u32 = 0x01;
-pub const UVM_DEINITIALIZE:             u32 = 0x02;
+pub const UVM_INITIALIZE: u32 = 0x01;
+pub const UVM_DEINITIALIZE: u32 = 0x02;
 
 // ---------------------------------------------------------------------------
 // Linux ioctl number encoding helpers

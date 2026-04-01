@@ -43,7 +43,10 @@ impl ShmAllocator {
     /// GPU mappings.  A typical value is 256 MiB or 1 GiB.
     pub fn new(bar_size: u64) -> Self {
         assert!(bar_size % 4096 == 0, "bar_size must be page-aligned");
-        Self { bar_size, cursor: 0 }
+        Self {
+            bar_size,
+            cursor: 0,
+        }
     }
 
     /// Allocate a region of `length` bytes.
@@ -84,7 +87,7 @@ mod tests {
         assert_eq!(r1.offset, 0);
         assert_eq!(r1.length, 100);
         let r2 = a.alloc(4096).unwrap();
-        assert_eq!(r2.offset, 4096);  // first alloc rounded up to one page
+        assert_eq!(r2.offset, 4096); // first alloc rounded up to one page
     }
 
     #[test]

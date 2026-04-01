@@ -32,7 +32,7 @@ pub struct IoctlEntry {
     pub number: u64,
     /// Raw NV_ESC_* index (for logging / debugging).
     pub escape: u32,
-    pub kind:   IoctlKind,
+    pub kind: IoctlKind,
 }
 
 /// Build the ioctl table for 535.129.03.
@@ -49,52 +49,52 @@ pub fn table() -> &'static [IoctlEntry] {
         IoctlEntry {
             number: _IOWR(NV_ESC_CHECK_VERSION_STR, 4096),
             escape: NV_ESC_CHECK_VERSION_STR,
-            kind:   IoctlKind::Simple,
+            kind: IoctlKind::Simple,
         },
         IoctlEntry {
             number: _IOWR(NV_ESC_CARD_INFO, 4096),
             escape: NV_ESC_CARD_INFO,
-            kind:   IoctlKind::Simple,
+            kind: IoctlKind::Simple,
         },
         IoctlEntry {
             number: _IOWR(NV_ESC_REGISTER_FD, 8),
             escape: NV_ESC_REGISTER_FD,
-            kind:   IoctlKind::FdCarrying,
+            kind: IoctlKind::FdCarrying,
         },
         IoctlEntry {
             number: _IOWR(NV_ESC_RM_ALLOC, 48),
             escape: NV_ESC_RM_ALLOC,
-            kind:   IoctlKind::RmAlloc,
+            kind: IoctlKind::RmAlloc,
         },
         IoctlEntry {
             number: _IOWR(NV_ESC_RM_CONTROL, 56),
             escape: NV_ESC_RM_CONTROL,
-            kind:   IoctlKind::RmControl,
+            kind: IoctlKind::RmControl,
         },
         IoctlEntry {
             number: _IOWR(NV_ESC_RM_FREE, 16),
             escape: NV_ESC_RM_FREE,
-            kind:   IoctlKind::Simple,
+            kind: IoctlKind::Simple,
         },
         IoctlEntry {
             number: _IOWR(NV_ESC_RM_MAP_MEMORY, 40),
             escape: NV_ESC_RM_MAP_MEMORY,
-            kind:   IoctlKind::Mapping,
+            kind: IoctlKind::Mapping,
         },
         IoctlEntry {
             number: _IOWR(NV_ESC_RM_UNMAP_MEMORY, 40),
             escape: NV_ESC_RM_UNMAP_MEMORY,
-            kind:   IoctlKind::Simple,
+            kind: IoctlKind::Simple,
         },
         IoctlEntry {
             number: _IOWR(NV_ESC_ALLOC_OS_EVENT, 16),
             escape: NV_ESC_ALLOC_OS_EVENT,
-            kind:   IoctlKind::FdCarrying,
+            kind: IoctlKind::FdCarrying,
         },
         IoctlEntry {
             number: _IOWR(NV_ESC_FREE_OS_EVENT, 16),
             escape: NV_ESC_FREE_OS_EVENT,
-            kind:   IoctlKind::FdCarrying,
+            kind: IoctlKind::FdCarrying,
         },
     ];
     TABLE

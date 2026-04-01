@@ -5,14 +5,22 @@
 // runtime after `NV_ESC_CHECK_VERSION_STR` succeeds.
 
 pub mod v535_129_03;
+pub mod v595_58_03;
 
 use crate::version::DriverVersion;
+use std::cell::OnceCell;
 
-/// The single version supported in Phase 1/2.
-pub const SUPPORTED: DriverVersion = DriverVersion::new(535, 129, 3);
+pub const SUPPORTED: OnceCell<Vec<DriverVersion>> = OnceCell::new();
 
 /// Returns true if the given version is supported.
 pub fn is_supported(v: DriverVersion) -> bool {
-    // For now, exact match only.  Relax to a range later.
-    v == SUPPORTED
+    let cell = SUPPORTED;
+    let supported = cell.get_or_init(|| {
+        // Versions supported
+        Vec::from([
+            DriverVersion::new(535, 129, 3),
+            DriverVersion::new(595, 58, 3),
+        ])
+    });
+    supported.contains(&v)
 }
