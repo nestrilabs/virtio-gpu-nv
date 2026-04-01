@@ -244,5 +244,3 @@ isolation.
 7. Use `#[repr(C)]` for all protocol and ABI structs.
 8. The SHM BAR is sized at VM creation time and is the only mechanism
    for sharing GPU mmap regions with the guest.
-
-Let's start with Phase 1.
