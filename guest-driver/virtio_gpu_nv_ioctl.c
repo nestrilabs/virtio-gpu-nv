@@ -42,6 +42,7 @@
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/poll.h>
 
 #include "virtio_gpu_nv.h"
 #include "virtio_gpu_nv_priv.h"
@@ -68,11 +69,15 @@ static int nv_open(struct inode *inode, struct file *filp) {
   struct open_resp *oresp;
   int ret;
 
+  resp.resp_payload = NULL;
+
   ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
   if (!ctx)
     return -ENOMEM;
 
   ctx->dev = ndev;
+  INIT_LIST_HEAD(&ctx->mappings);
+  spin_lock_init(&ctx->mappings_lock);
 
   memset(&req_payload, 0, sizeof(req_payload));
   if (ncdev->minor == MINOR_CTL) {
@@ -111,11 +116,12 @@ static int nv_open(struct inode *inode, struct file *filp) {
 
   oresp = (struct open_resp *)resp.resp_payload;
   ctx->guest_handle = le64_to_cpu(oresp->guest_handle);
-
+  kfree(resp.resp_payload);
   filp->private_data = ctx;
   return 0;
 
 err_free:
+  kfree(resp.resp_payload);
   kfree(ctx);
   return ret;
 }
@@ -132,6 +138,8 @@ static int nv_release(struct inode *inode, struct file *filp) {
   struct nv_request resp;
   int ret;
 
+  resp.resp_payload = NULL;
+
   req_hdr.msg_type = cpu_to_le32(NV_MSG_CLOSE);
   req_hdr.cookie = cpu_to_le64(next_cookie(ndev));
   req_hdr._pad = 0;
@@ -146,6 +154,18 @@ static int nv_release(struct inode *inode, struct file *filp) {
     pr_warn("nv_release: backend status %u\n",
             le32_to_cpu(resp.resp_hdr.status));
 
+  /* Free any recorded mapping info. */
+  {
+    struct nv_mapping_info *mi, *tmp;
+    spin_lock(&ctx->mappings_lock);
+    list_for_each_entry_safe(mi, tmp, &ctx->mappings, list) {
+      list_del(&mi->list);
+      kfree(mi);
+    }
+    spin_unlock(&ctx->mappings_lock);
+  }
+
+  kfree(resp.resp_payload);
   kfree(ctx);
   filp->private_data = NULL;
   return 0;
@@ -172,6 +192,8 @@ long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
   struct ioctl_resp *iresp;
   void *param_buf = NULL;
   long ret;
+
+  resp.resp_payload = NULL;
 
   if (param_size > NV_MAX_PARAM_SIZE)
     return -EINVAL;
@@ -223,8 +245,25 @@ long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
     }
   }
 
+  /* If the backend returned SHM mapping metadata, record it so
+   * nv_mmap() can look up the pgprot later. */
+  if (le64_to_cpu(iresp->shm_length) > 0) {
+    struct nv_mapping_info *mi = kmalloc(sizeof(*mi), GFP_KERNEL);
+    if (mi) {
+      mi->shm_offset = le64_to_cpu(iresp->shm_offset);
+      mi->shm_length = le64_to_cpu(iresp->shm_length);
+      mi->pgprot = iresp->pgprot;
+      spin_lock(&ctx->mappings_lock);
+      list_add_tail(&mi->list, &ctx->mappings);
+      spin_unlock(&ctx->mappings_lock);
+    } else {
+      pr_warn("nv_ioctl: failed to alloc nv_mapping_info\n");
+    }
+  }
+
   ret = 0;
 out:
+  kfree(resp.resp_payload);
   kfree(param_buf);
   return ret;
 }
@@ -234,6 +273,7 @@ out:
  * ---------------------------------------------------------------------- */
 
 static __poll_t nv_poll(struct file *filp, struct poll_table_struct *wait) {
+  pr_warn_once("nv_ioctl: nv_poll not yet implemented, fill just return EPOLLIN | EPOLLOUT");
   return EPOLLIN | EPOLLOUT;
 }
 

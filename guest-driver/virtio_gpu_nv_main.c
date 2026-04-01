@@ -26,25 +26,10 @@
  * Module metadata
  * ---------------------------------------------------------------------- */
 
-MODULE_LICENSE("Apache-2.0 / GPL-2.0");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("virtio-gpu-nv contributors");
 MODULE_DESCRIPTION("virtio NVIDIA ioctl forwarding driver");
 MODULE_VERSION("0.1.0");
-
-/* -------------------------------------------------------------------------
- * Character device numbering
- *
- * We register a contiguous range:
- *   minor 0            → /dev/nvidiactl
- *   minor 1..MAX_GPU   → /dev/nvidia0..MAX_GPU-1
- *   minor MAX_GPU+1    → /dev/nvidia-uvm
- * ---------------------------------------------------------------------- */
-
-#define MAX_GPU 8
-#define MINOR_CTL 0
-#define MINOR_GPU_BASE 1                     /* minors 1..8  */
-#define MINOR_UVM (MINOR_GPU_BASE + MAX_GPU) /* minor 9  */
-#define NUM_MINORS (MINOR_UVM + 1)
 
 static dev_t nv_devt_base;
 static struct class *nv_class;
@@ -65,8 +50,9 @@ extern const struct file_operations nv_fops;
 static int nv_probe(struct virtio_device *vdev) {
   struct nv_dev *ndev;
   struct virtqueue *vqs[NUM_QUEUES];
-  static const char *const vq_names[] = {"request"};
-  vq_callback_t *vq_cbs[NUM_QUEUES] = {nv_vq_callback};
+  struct virtqueue_info vqs_info[NUM_QUEUES] = {
+      { .name = "request", .callback = nv_vq_callback },
+  };
   int i, ret;
 
   ndev = kzalloc(sizeof(*ndev), GFP_KERNEL);
@@ -81,7 +67,7 @@ static int nv_probe(struct virtio_device *vdev) {
   atomic_set(&ndev->next_cookie, 1);
 
   /* Allocate virtqueues. */
-  ret = virtio_find_vqs(vdev, NUM_QUEUES, vqs, vq_cbs, vq_names, NULL);
+  ret = virtio_find_vqs(vdev, NUM_QUEUES, vqs, vqs_info, NULL);
   if (ret) {
     dev_err(&vdev->dev, "virtio_find_vqs failed: %d\n", ret);
     goto err_free;

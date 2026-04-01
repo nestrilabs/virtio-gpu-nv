@@ -85,7 +85,7 @@ struct msg_header {
  */
 struct resp_header {
   __le32 status;
-  __le32 errno_host;
+  __s32 errno_host;
   __le64 cookie;
 } __packed;
 
@@ -180,17 +180,35 @@ struct ioctl_resp {
 } __packed;
 
 /* -------------------------------------------------------------------------
- * Per-file private data  (stored in file->private_data)
+ * Per-mapping metadata (stored after a successful NV_ESC_RM_MAP_MEMORY)
  * ---------------------------------------------------------------------- */
+
+/**
+ * struct nv_mapping_info - Records SHM metadata from a mapping ioctl.
+ * @list:       Linked into nv_file_ctx::mappings.
+ * @shm_offset: SHM BAR byte offset (what userspace passes as mmap offset).
+ * @shm_length: Length in bytes.
+ * @pgprot:     Cache type: 0=WB, 1=WC, 2=UC.
+ */
+struct nv_mapping_info {
+  struct list_head list;
+  __u64 shm_offset;
+  __u64 shm_length;
+  __u8 pgprot;
+};
 
 /**
  * struct nv_file_ctx - State associated with one open() of /dev/nvidia*.
  * @guest_handle: Handle assigned by the backend on OPEN.
  * @dev:          Pointer to the owning nv_dev (for virtqueue access).
+ * @mappings:     List of nv_mapping_info from successful mapping ioctls.
+ * @mappings_lock: Protects the mappings list.
  */
 struct nv_file_ctx {
   __u64 guest_handle;
   struct nv_dev *dev;
+  struct list_head mappings;
+  spinlock_t mappings_lock;
 };
 
 #endif /* VIRTIO_GPU_NV_H */

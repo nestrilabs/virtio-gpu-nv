@@ -88,5 +88,20 @@ long nv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 
 /* virtio_gpu_nv_mmap.c */
 int nv_mmap(struct file *filp, struct vm_area_struct *vma);
+void nv_set_shm_bar_pfn(unsigned long pfn);
+
+/* -------------------------------------------------------------------------
+ * Character device minor numbering
+ *
+ *   minor 0            → /dev/nvidiactl
+ *   minor 1..MAX_GPU   → /dev/nvidia0..MAX_GPU-1
+ *   minor MAX_GPU+1    → /dev/nvidia-uvm
+ * ---------------------------------------------------------------------- */
+
+#define MAX_GPU 8
+#define MINOR_CTL 0
+#define MINOR_GPU_BASE 1
+#define MINOR_UVM (MINOR_GPU_BASE + MAX_GPU)
+#define NUM_MINORS (MINOR_UVM + 1)
 
 #endif /* VIRTIO_GPU_NV_PRIV_H */

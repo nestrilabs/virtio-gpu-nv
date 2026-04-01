@@ -76,8 +76,9 @@ pub fn table() -> &'static [IoctlEntry] {
             escape: NV_ESC_RM_FREE,
             kind: IoctlKind::Simple,
         },
+        // IoctlNVOS33ParametersWithFD: NVOS33_PARAMETERS(48) + FD(4) + pad(4) = 56
         IoctlEntry {
-            number: _IOWR(NV_ESC_RM_MAP_MEMORY, 40),
+            number: _IOWR(NV_ESC_RM_MAP_MEMORY, 56),
             escape: NV_ESC_RM_MAP_MEMORY,
             kind: IoctlKind::Mapping,
         },

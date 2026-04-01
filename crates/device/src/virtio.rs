@@ -1,112 +1,30 @@
 // crates/device/src/virtio.rs
 //
-// Virtio device trait and queue-processing loop.
+// Public API surface for VMM integration.
 //
-// This module provides the glue between libkrun's virtio infrastructure and
-// `NvidiaBackend`.  In Phase 1 we define the trait and a simple polling loop;
-// actual libkrun integration is wired up later.
+// This module re-exports the types that a VMM (e.g. libkrun) needs to
+// integrate virtio-gpu-nv.  The VMM implements the virtio transport and
+// calls NvidiaBackend::dispatch() for each descriptor chain.
 //
-// The virtio spec (section 2.6) defines the split virtqueue layout:
-//   - Descriptor table: array of descriptors (addr, len, flags, next)
-//   - Available ring: guest→host notification ring
-//   - Used ring:      host→guest notification ring
-//
-// For our single virtqueue:
-//   - Each descriptor chain represents one operation.
-//   - Readable descriptors = request buffer.
-//   - Writable descriptors = response buffer.
+// See INTEGRATION.md for how to wire this into libkrun.
 
-use crate::nvidia::NvidiaBackend;
-use crate::shm::ZoneConfig;
+/// The virtio device ID that the guest driver probes for.
+pub const VIRTIO_ID_GPU_NV: u32 = 0x8042;
 
-// ---------------------------------------------------------------------------
-// Virtio descriptor (as seen by the backend after GPA→HVA translation)
-// ---------------------------------------------------------------------------
+/// Number of virtqueues (single request queue).
+pub const NUM_QUEUES: usize = 1;
 
-/// A single scatter-gather entry after the VMM has resolved guest physical
-/// addresses to host virtual addresses.
-pub struct Descriptor<'a> {
-    pub data: &'a [u8],
-    pub writable: bool,
-}
+/// Recommended virtqueue size.
+pub const QUEUE_SIZE: u16 = 256;
 
-/// A resolved descriptor chain for one operation.
-pub struct DescChain<'a> {
-    pub descriptors: Vec<Descriptor<'a>>,
-}
-
-impl<'a> DescChain<'a> {
-    /// Collect all readable bytes in order into a single contiguous slice.
-    ///
-    /// We allocate a Vec here because the readable part may be split across
-    /// multiple physical pages; in practice NVIDIA ioctl params fit in a
-    /// single page so this is rarely needed.
-    pub fn readable_bytes(&self) -> Vec<u8> {
-        self.descriptors
-            .iter()
-            .filter(|d| !d.writable)
-            .flat_map(|d| d.data.iter().copied())
-            .collect()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// VirtioDevice trait
-// ---------------------------------------------------------------------------
-
-/// Implemented by the libkrun integration layer to give `NvidiaDevice` access
-/// to the virtqueue machinery.
-pub trait VirtioDevice {
-    /// Block until a new descriptor chain is available, then call `f` with:
-    ///   - the readable buffer (request),
-    ///   - the writable buffer (response),
-    ///
-    /// `f` should write into `resp` and return the number of bytes written.
-    /// The implementation posts the used element back to the guest.
-    fn process_queue<F>(&mut self, f: F)
-    where
-        F: FnMut(&[u8], &mut [u8]) -> usize;
-}
-
-// ---------------------------------------------------------------------------
-// NvidiaDevice: the public API for libkrun integration
-// ---------------------------------------------------------------------------
-
-/// Wraps `NvidiaBackend` and drives the virtqueue processing loop.
-pub struct NvidiaDevice {
-    backend: NvidiaBackend,
-}
-
-impl NvidiaDevice {
-    /// Create with an explicit zone configuration.
-    /// libkrun passes this in after reading the BAR size from VM config.
-    pub fn new(cfg: ZoneConfig) -> Self {
-        Self {
-            backend: NvidiaBackend::new(cfg),
-        }
-    }
-
-    /// Create with the default 256 MiB zone split.
-    /// Convenience constructor for tests and simple integrations.
-    pub fn with_default_zones() -> Self {
-        Self {
-            backend: NvidiaBackend::with_default_zones(),
-        }
-    }
-
-    /// Run the device loop using the provided virtio transport.
-    ///
-    /// Blocks indefinitely; call from a dedicated thread.
-    /// Call `teardown()` after this returns (or on SIGTERM) to close host fds.
-    pub fn run<V: VirtioDevice>(&mut self, mut transport: V) {
-        loop {
-            let backend = &mut self.backend;
-            transport.process_queue(|req, resp| backend.dispatch(req, resp));
-        }
-    }
-
-    /// Close all host file descriptors. Call on VM shutdown or crash.
-    pub fn teardown(&mut self) {
-        self.backend.teardown();
-    }
+/// Device configuration space layout.
+///
+/// The VMM should expose this via virtio config reads.
+/// The guest driver reads shm_bar_gpa to configure nv_mmap().
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct NvGpuConfig {
+    pub num_gpus: u32,
+    pub shm_bar_gpa: u64,
+    pub shm_bar_size: u64,
 }

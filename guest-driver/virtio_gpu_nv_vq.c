@@ -39,9 +39,6 @@
 #define NV_RESP_PENDING 0
 #define NV_RESP_DONE 1
 
-/* Stored in the low bit of an atomic so we can use wait_event_atomic. */
-static DEFINE_PER_CPU(int, dummy); /* unused; completion is per-nv_dev */
-
 /* -------------------------------------------------------------------------
  * nv_vq_callback — called from virtio interrupt context
  * ---------------------------------------------------------------------- */
@@ -117,8 +114,8 @@ int nv_do_request(struct nv_dev *ndev, const void *req_hdr, size_t req_hdr_size,
 
   /* Wait for the used-ring entry.
    * The condition is: virtqueue_get_buf() returns non-NULL. */
-  ret = wait_event_interruptible(
-      ndev->resp_wq, (token = virtqueue_get_buf(ndev->vq, &len)) != NULL);
+  wait_event(ndev->resp_wq, (token = virtqueue_get_buf(ndev->vq, &len)) != NULL);
+  ret = 0;
 
   if (ret) {
     /* Interrupted by a signal.  The virtqueue entry is still
@@ -137,10 +134,18 @@ int nv_do_request(struct nv_dev *ndev, const void *req_hdr, size_t req_hdr_size,
   }
 
   memcpy(&out->resp_hdr, resp_buf, sizeof(struct resp_header));
-
-  /* Point at the payload region (valid until next call). */
-  out->resp_payload = (char *)resp_buf + sizeof(struct resp_header);
   out->resp_payload_len = len - sizeof(struct resp_header);
+
+  if (out->resp_payload_len > 0) {
+    out->resp_payload = kmemdup((char *)resp_buf + sizeof(struct resp_header),
+                                out->resp_payload_len, GFP_KERNEL);
+    if (!out->resp_payload) {
+      ret = -ENOMEM;
+      goto out_unlock;
+    }
+  } else {
+    out->resp_payload = NULL;
+  }
 
 out_unlock:
   mutex_unlock(&ndev->vq_lock);

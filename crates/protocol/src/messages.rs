@@ -121,10 +121,10 @@ pub enum DeviceKind {
 pub struct OpenReq {
     /// Which device family to open.
     pub kind: u8,
-    /// Reserved; must be zero.
-    pub _pad: [u8; 6],
     /// GPU index (0-based) when `kind == DeviceKind::Gpu`, ignored otherwise.
     pub index: u8,
+    /// Reserved; must be zero.
+    pub _pad: [u8; 6],
 }
 
 /// Response payload for `MsgType::Open`.

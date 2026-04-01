@@ -54,7 +54,6 @@ pub struct NvidiaBackend {
     handles: HandleTable,
     shm: ShmAllocator,
 }
-
 impl NvidiaBackend {
     /// Create a backend with a custom SHM zone config.
     pub fn new(cfg: ZoneConfig) -> Self {
@@ -67,6 +66,20 @@ impl NvidiaBackend {
     /// Create a backend with the default 256 MiB zone split.
     pub fn with_default_zones() -> Self {
         Self::new(ZoneConfig::default_256mib())
+    }
+
+    /// Total SHM BAR size (for VMM config space).
+    pub fn shm_total_size(&self) -> u64 {
+        self.shm.total_size()
+    }
+
+    /// Raw memfd fd (for KVM memslot creation).
+    pub fn shm_memfd_raw(&self) -> i32 {
+        self.shm.memfd_raw()
+    }
+
+    pub fn shm_base_ptr(&self) -> *mut u8 {
+        self.shm.base_ptr()
     }
 
     /// Create a minimal backend suitable for unit tests (8-page total BAR).
@@ -217,17 +230,30 @@ impl NvidiaBackend {
             }
 
             NV_ESC_RM_MAP_MEMORY => {
-                // Phase 3: allocate from shm, mmap host fd, return offset.
-                // pgprot must be determined per-mapping from the RM mapping
-                // flags in NVOS03_PARAMETERS::flags — see nvproxy
-                // frontend.go:rmMapMemory() for the UC/WC/WB classification.
-                log::debug!("NV_ESC_RM_MAP_MEMORY: stub (Phase 3)");
-                self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOSYS)
+                self.dispatch_map_memory(cookie, host_fd, ireq.request, param_in, resp_buf)
             }
 
-            NV_ESC_RM_CONTROL | NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY => {
-                log::debug!("escape 0x{:02x}: nested dispatch stub (Phase 3)", escape);
-                self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOSYS)
+            NV_ESC_RM_MAP_MEMORY_DMA => {
+                log::debug!("NV_ESC_RM_MAP_MEMORY_DMA: pass-through");
+                self.dispatch_simple(cookie, host_fd, ireq.request, param_in, resp_buf)
+            }
+
+            // ---------------------------------------------------------------
+            // Nested-dispatch ioctls — pass through to host for now.
+            //
+            // Phase 3 TODO: parse NVOS64_PARAMETERS to extract hClass
+            // (RM_ALLOC) or NVOS54_PARAMETERS to extract cmd (RM_CONTROL)
+            // for per-class/per-cmd validation and object tracking.
+            // For now, forward as simple ioctls so Vulkan init can proceed.
+            // ---------------------------------------------------------------
+            NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY => {
+                log::debug!("NV_ESC_RM_ALLOC (0x{:02x}): pass-through", escape);
+                self.dispatch_simple(cookie, host_fd, ireq.request, param_in, resp_buf)
+            }
+
+            NV_ESC_RM_CONTROL => {
+                log::debug!("NV_ESC_RM_CONTROL: pass-through");
+                self.dispatch_simple(cookie, host_fd, ireq.request, param_in, resp_buf)
             }
 
             other => {
@@ -275,9 +301,12 @@ impl NvidiaBackend {
         use abi::ioctl::*;
 
         let fd_offset: usize = match escape {
+            // nv_ioctl_register_fd_t: ctl_fd is the only field, offset 0.
             NV_ESC_REGISTER_FD => 0,
-            NV_ESC_ALLOC_OS_EVENT => 16,
-            NV_ESC_FREE_OS_EVENT => 0,
+            // nv_ioctl_alloc_os_event_t: hClient(4) + hDevice(4) + fd @ offset 8
+            NV_ESC_ALLOC_OS_EVENT => 8,
+            // nv_ioctl_free_os_event_t: same layout as alloc, fd @ offset 8
+            NV_ESC_FREE_OS_EVENT => 8,
             _ => return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOTTY),
         };
 
@@ -315,6 +344,203 @@ impl NvidiaBackend {
         param_buf[fd_offset..fd_offset + 4].copy_from_slice(&(guest_embedded as i32).to_le_bytes());
 
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
+    }
+
+    // ------------------------------------------------------------------
+    // NV_ESC_RM_MAP_MEMORY handler
+    //
+    // Wire layout of param_in (IoctlNVOS33ParametersWithFD):
+    //
+    //   offset  0: NVOS33_PARAMETERS (48 bytes)
+    //     offset  0: hClient       u32
+    //     offset  4: hDevice       u32
+    //     offset  8: hMemory       u32
+    //     offset 12: pad           [4]u8
+    //     offset 16: offset        u64
+    //     offset 24: length        u64
+    //     offset 32: pLinearAddress u64
+    //     offset 40: status        u32
+    //     offset 44: flags         u32
+    //   offset 48: fd              i32   (guest handle → host fd)
+    //   offset 52: pad             [4]u8
+    //
+    // Total: 56 bytes.
+    //
+    // Flow (ported from gVisor nvproxy frontend.go:rmMapMemory):
+    //   1. Translate the embedded FD (guest handle → host fd).
+    //   2. Call the host ioctl.
+    //   3. If successful, read the updated flags to determine caching type.
+    //   4. Allocate a region from the SHM BAR (correct zone per pgprot).
+    //   5. mmap the host fd into the SHM region.
+    //   6. Return the SHM offset, length, and pgprot to the guest.
+    //   7. Restore the guest handle in the response params.
+    // ------------------------------------------------------------------
+    fn dispatch_map_memory(
+        &mut self,
+        cookie: u64,
+        host_fd: RawFd,
+        request: u64,
+        param_in: &[u8],
+        resp_buf: &mut [u8],
+    ) -> usize {
+        use crate::shm::PgprotKind;
+
+        const _NVOS33_SIZE: usize = 48;
+        const WITH_FD_SIZE: usize = 56;
+        const FD_OFFSET: usize = 48;
+        const LENGTH_OFFSET: usize = 24;
+        const STATUS_OFFSET: usize = 40;
+        const FLAGS_OFFSET: usize = 44;
+
+        const FLAGS_CACHING_TYPE_SHIFT: u32 = 23;
+        const FLAGS_CACHING_TYPE_MASK: u32 = 0x7;
+        const CACHING_TYPE_CACHED: u32 = 0;
+        const CACHING_TYPE_UNCACHED: u32 = 1;
+        const CACHING_TYPE_WRITECOMBINED: u32 = 2;
+        const CACHING_TYPE_WRITEBACK: u32 = 5;
+        const CACHING_TYPE_DEFAULT: u32 = 6;
+        const CACHING_TYPE_UNCACHED_WEAK: u32 = 7;
+
+        if param_in.len() < WITH_FD_SIZE {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+        }
+
+        // --- Step 1: Translate embedded FD (guest handle → host fd) ---
+
+        let guest_fd_handle = {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&param_in[FD_OFFSET..FD_OFFSET + 4]);
+            i32::from_le_bytes(b) as u64
+        };
+
+        let host_map_fd = match self.handles.get_raw(guest_fd_handle) {
+            Ok(fd) => fd,
+            Err(_) => {
+                log::warn!(
+                    "NV_ESC_RM_MAP_MEMORY: bad embedded FD handle {}",
+                    guest_fd_handle
+                );
+                return self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0);
+            }
+        };
+
+        let mut param_buf = param_in.to_vec();
+        param_buf[FD_OFFSET..FD_OFFSET + 4].copy_from_slice(&(host_map_fd as i32).to_le_bytes());
+
+        // --- Step 2: Call host ioctl ---
+
+        let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
+
+        if rc < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            log::warn!("NV_ESC_RM_MAP_MEMORY: host ioctl failed: errno={}", errno);
+            // Restore guest handle before returning
+            param_buf[FD_OFFSET..FD_OFFSET + 4]
+                .copy_from_slice(&(guest_fd_handle as i32).to_le_bytes());
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+        }
+
+        // --- Step 3: Check RM status and read updated fields ---
+
+        let rm_status = u32::from_le_bytes(
+            param_buf[STATUS_OFFSET..STATUS_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+
+        // Restore guest handle in param_buf for copy-out regardless of status.
+        param_buf[FD_OFFSET..FD_OFFSET + 4]
+            .copy_from_slice(&(guest_fd_handle as i32).to_le_bytes());
+
+        if rm_status != 0 {
+            // RM returned an error status (NV_OK == 0).
+            // Forward the params back so the guest can read the status field.
+            log::debug!("NV_ESC_RM_MAP_MEMORY: RM status 0x{:x}", rm_status);
+            return self.write_ioctl_resp(resp_buf, cookie, &param_buf);
+        }
+
+        let length = u64::from_le_bytes(
+            param_buf[LENGTH_OFFSET..LENGTH_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+
+        let flags = u32::from_le_bytes(
+            param_buf[FLAGS_OFFSET..FLAGS_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+
+        // --- Step 4: Determine pgprot from caching type ---
+        //
+        // The host driver may have updated the caching type in flags after
+        // the ioctl (see nvproxy's rmMapMemory comment about this).
+
+        let caching_type = (flags >> FLAGS_CACHING_TYPE_SHIFT) & FLAGS_CACHING_TYPE_MASK;
+
+        let pgprot = match caching_type {
+            CACHING_TYPE_CACHED | CACHING_TYPE_WRITEBACK => PgprotKind::WriteBack,
+            CACHING_TYPE_WRITECOMBINED | CACHING_TYPE_DEFAULT => PgprotKind::WriteCombine,
+            CACHING_TYPE_UNCACHED | CACHING_TYPE_UNCACHED_WEAK => PgprotKind::Uncached,
+            other => {
+                log::warn!(
+                    "NV_ESC_RM_MAP_MEMORY: unknown caching type {}, defaulting to UC",
+                    other
+                );
+                PgprotKind::Uncached
+            }
+        };
+
+        // --- Step 5: Allocate SHM region ---
+
+        let region = match self.shm.alloc(length, pgprot) {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
+            }
+        };
+
+        // --- Step 6: mmap the host fd into the SHM region ---
+
+        if let Err(e) = unsafe { self.shm.map_host_fd(region.offset, length, host_map_fd) } {
+            log::error!("NV_ESC_RM_MAP_MEMORY: map_host_fd failed: {}", e);
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
+        }
+
+        log::info!(
+            "NV_ESC_RM_MAP_MEMORY: allocated SHM region offset=0x{:x} length=0x{:x} pgprot={:?}",
+            region.offset,
+            region.length,
+            region.pgprot,
+        );
+
+        // --- Step 7: Build response with SHM metadata ---
+
+        let hdr = RespHeader {
+            status: Status::Ok as u32,
+            cookie,
+            errno_host: 0,
+        };
+        let iresp = IoctlResp {
+            param_size: param_buf.len() as u32,
+            _pad: 0,
+            shm_offset: region.offset,
+            shm_length: length,
+            pgprot: pgprot as u8,
+            _pad2: [0; 7],
+        };
+
+        let need = size_of::<RespHeader>() + size_of::<IoctlResp>() + param_buf.len();
+        if resp_buf.len() < need {
+            return self.write_error_resp(resp_buf, Status::BufferTooSmall, cookie, 0);
+        }
+
+        let mut off = 0;
+        off += write_struct(&mut resp_buf[off..], &hdr);
+        off += write_struct(&mut resp_buf[off..], &iresp);
+        resp_buf[off..off + param_buf.len()].copy_from_slice(&param_buf);
+        off + param_buf.len()
     }
 
     // ------------------------------------------------------------------
@@ -610,18 +836,24 @@ mod tests {
         let gh = parse_open_resp(&oresp).guest_handle;
         assert!(gh > 0);
 
-        let param_size: u32 = 68;
+        // nv_ioctl_rm_api_version_t: cmd(4) + reply(4) + versionString(64) = 72 bytes
+        let param_size: u32 = 72;
         let mut ireq = hdr(MsgType::Ioctl, 2);
+        // NV_ESC_CHECK_VERSION_STR = NV_IOCTL_BASE + 10 = 210
+        // _IOWR('F', 210, 72) = (3 << 30) | (72 << 16) | (0x46 << 8) | 210
         append(
             &mut ireq,
             &IoctlReq {
                 guest_handle: gh,
-                request: ((3u64 << 30) | (68 << 16) | (0x46 << 8) | 0x25),
+                request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_CHECK_VERSION_STR, param_size),
                 param_size,
                 _pad: 0,
             },
         );
-        ireq.extend(vec![0u8; param_size as usize]);
+        // First 4 bytes = cmd field. Set to '2' (0x32) for query mode.
+        let mut params = vec![0u8; param_size as usize];
+        params[0] = 0x32;
+        ireq.extend(params);
 
         let mut iresp = vec![0u8; 512];
         be.dispatch(&ireq, &mut iresp);
@@ -630,6 +862,136 @@ mod tests {
             r.status == Status::Ok as u32 || r.status == Status::IoctlFailed as u32,
             "unexpected status {}",
             r.status
+        );
+    }
+
+    /// NV_ESC_RM_MAP_MEMORY round-trip.
+    ///
+    /// We can't test a real mapping without a valid RM client/device/memory
+    /// triple, but we CAN test that:
+    ///   1. The dispatch path is reached (not hitting "unhandled escape").
+    ///   2. The embedded FD is translated correctly.
+    ///   3. The host ioctl failure is reported cleanly (since we don't have
+    ///      valid RM handles, the host driver will reject the call).
+    #[test]
+    fn map_memory_rejects_bad_fd_handle() {
+        let mut be = NvidiaBackend::for_test();
+
+        // We need an open nvidiactl fd as the "outer" fd for the ioctl.
+        if !nvidiactl_present() {
+            return;
+        }
+
+        // Open nvidiactl.
+        let mut oreq = hdr(MsgType::Open, 1);
+        append(
+            &mut oreq,
+            &OpenReq {
+                kind: DeviceKind::Ctl as u8,
+                index: 0,
+                _pad: [0; 6],
+            },
+        );
+        let mut oresp = vec![0u8; 64];
+        be.dispatch(&oreq, &mut oresp);
+        let gh = parse_open_resp(&oresp).guest_handle;
+        assert!(gh > 0);
+
+        // Build a NV_ESC_RM_MAP_MEMORY ioctl with a bogus embedded FD handle.
+        // IoctlNVOS33ParametersWithFD = 56 bytes.
+        let param_size: u32 = 56;
+        let mut ireq = hdr(MsgType::Ioctl, 2);
+        append(
+            &mut ireq,
+            &IoctlReq {
+                guest_handle: gh,
+                request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_MAP_MEMORY, param_size),
+                param_size,
+                _pad: 0,
+            },
+        );
+
+        // 56 bytes of zeroed params — the embedded FD at offset 48 is 0,
+        // which is not a valid guest handle.
+        let mut params = vec![0u8; param_size as usize];
+        // Write a bogus FD handle (0xDEAD) at offset 48.
+        params[48..52].copy_from_slice(&0xDEADu32.to_le_bytes());
+        ireq.extend(params);
+
+        let mut iresp = vec![0u8; 512];
+        be.dispatch(&ireq, &mut iresp);
+        let r = parse_resp(&iresp);
+
+        // Should fail with BadHandle since 0xDEAD is not in the handle table.
+        assert_eq!(r.status, Status::BadHandle as u32);
+    }
+
+    #[test]
+    fn map_memory_translates_fd_and_forwards() {
+        if !nvidiactl_present() {
+            return;
+        }
+
+        let mut be = NvidiaBackend::for_test();
+
+        // Open nvidiactl — this is both the "outer" fd and the "map" fd.
+        let mut oreq = hdr(MsgType::Open, 1);
+        append(
+            &mut oreq,
+            &OpenReq {
+                kind: DeviceKind::Ctl as u8,
+                index: 0,
+                _pad: [0; 6],
+            },
+        );
+        let mut oresp = vec![0u8; 64];
+        be.dispatch(&oreq, &mut oresp);
+        let ctl_handle = parse_open_resp(&oresp).guest_handle;
+
+        // Open a second nvidiactl fd to use as the embedded map FD.
+        let mut oreq2 = hdr(MsgType::Open, 2);
+        append(
+            &mut oreq2,
+            &OpenReq {
+                kind: DeviceKind::Ctl as u8,
+                index: 0,
+                _pad: [0; 6],
+            },
+        );
+        let mut oresp2 = vec![0u8; 64];
+        be.dispatch(&oreq2, &mut oresp2);
+        let map_handle = parse_open_resp(&oresp2).guest_handle;
+
+        // Build IoctlNVOS33ParametersWithFD with the map_handle as embedded FD.
+        let param_size: u32 = 56;
+        let mut ireq = hdr(MsgType::Ioctl, 3);
+        append(
+            &mut ireq,
+            &IoctlReq {
+                guest_handle: ctl_handle,
+                request: abi::ioctl::_IOWR(abi::ioctl::NV_ESC_RM_MAP_MEMORY, param_size),
+                param_size,
+                _pad: 0,
+            },
+        );
+
+        let mut params = vec![0u8; param_size as usize];
+        // Embedded FD at offset 48 = map_handle.
+        params[48..52].copy_from_slice(&(map_handle as u32).to_le_bytes());
+        ireq.extend(params);
+
+        let mut iresp = vec![0u8; 512];
+        be.dispatch(&ireq, &mut iresp);
+        let r = parse_resp(&iresp);
+
+        // The host ioctl will fail (we have no valid RM objects) but the
+        // dispatch path should reach the host ioctl — so we expect either
+        // IoctlFailed (host rejected it) or Ok (unlikely without valid handles).
+        // The key thing: it should NOT be BadHandle, proving FD translation worked.
+        assert_ne!(
+            r.status,
+            Status::BadHandle as u32,
+            "FD translation should have succeeded"
         );
     }
 }
