@@ -322,6 +322,18 @@ impl NvidiaBackend {
                 &outer[..std::cmp::min(outer.len(), 48)]
             );
 
+            if (request & 0xFF) == 0x2a {
+                let status = u32::from_le_bytes(outer[28..32].try_into().unwrap());
+                let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
+                if status != 0 {
+                    log::warn!(
+                        "RM_CONTROL cmd=0x{:08x} returned status=0x{:x}",
+                        cmd,
+                        status
+                    );
+                }
+            }
+
             // Zero pointer before sending back to guest
             outer[ptr_offset..ptr_offset + 8].copy_from_slice(&0u64.to_le_bytes());
 
