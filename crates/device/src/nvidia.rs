@@ -231,48 +231,40 @@ impl NvidiaBackend {
             // ---------------------------------------------------------------
             // RM control requires nested handling
             // ---------------------------------------------------------------
-            NV_ESC_RM_CONTROL => {
-                self.dispatch_nested(cookie, host_fd, ireq.request, param_in, resp_buf,
-                                     32, 16, 24)
-            }
+            NV_ESC_RM_CONTROL => self.dispatch_nested(
+                cookie,
+                host_fd,
+                ireq.request,
+                param_in,
+                resp_buf,
+                32,
+                16,
+                24,
+            ),
 
             // ---------------------------------------------------------------
             // RM alloc as well..
             // ---------------------------------------------------------------
-            NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY => {
-                self.dispatch_nested(cookie, host_fd, ireq.request, param_in, resp_buf,
-                                     48, 16, 32)
-            }
+            NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY => self.dispatch_nested(
+                cookie,
+                host_fd,
+                ireq.request,
+                param_in,
+                resp_buf,
+                48,
+                16,
+                32,
+            ),
 
             // ---------------------------------------------------------------
             // Everything else — simple passthrough to host
-            //
-            // This includes NV_ESC_CHECK_VERSION_STR, NV_ESC_CARD_INFO,
-            // NV_ESC_SYS_PARAMS, NV_ESC_ATTACH_GPUS_TO_FD,
-            // NV_ESC_WAIT_OPEN_COMPLETE, all RM escapes, etc.
-            //
-            // Only ioctls that carry embedded FDs or need SHM handling
-            // require special dispatch above.
             // ---------------------------------------------------------------
-            other => {
-                if tracing::enabled!(tracing::Level::TRACE) {
-                    tracing::trace!(
-                        "ioctl passthrough escape=0x{:02x} size={}",
-                        other,
-                        param_in.len()
-                    );
-                } else if other != NV_ESC_CHECK_VERSION_STR
-                    && other != NV_ESC_CARD_INFO
-                    && other != NV_ESC_RM_ALLOC
-                    && other != NV_ESC_RM_CONTROL
-                    && other != NV_ESC_RM_FREE
-                {
-                    tracing::debug!(
-                        "ioctl passthrough escape=0x{:02x} size={}",
-                        other,
-                        param_in.len()
-                    );
-                }
+            _other => {
+                tracing::debug!(
+                    "ioctl passthrough escape=0x{:02x} size={}",
+                    _other,
+                    param_in.len()
+                );
                 self.dispatch_simple(cookie, host_fd, ireq.request, param_in, resp_buf)
             }
         }
@@ -295,7 +287,7 @@ impl NvidiaBackend {
         resp_buf: &mut [u8],
         outer_size: usize,
         ptr_offset: usize,
-        size_offset: usize,
+        _size_offset: usize,
     ) -> usize {
         if param_in.len() < outer_size {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
@@ -304,21 +296,17 @@ impl NvidiaBackend {
         let mut outer = param_in[..outer_size].to_vec();
         let nested_in = &param_in[outer_size..];
 
-        let params_size = u32::from_le_bytes(
-            outer[size_offset..size_offset + 4].try_into().unwrap(),
-        ) as usize;
-
-        if params_size > 0 && !nested_in.is_empty() {
-            // Allocate host buffer, copy nested params in
-            let mut host_buf = vec![0u8; params_size];
-            let copy_len = nested_in.len().min(params_size);
-            host_buf[..copy_len].copy_from_slice(&nested_in[..copy_len]);
+        if !nested_in.is_empty() {
+            // Guest sent nested params — allocate host buffer, point struct at it
+            let nested_size = nested_in.len();
+            let mut host_buf = vec![0u8; nested_size];
+            host_buf.copy_from_slice(nested_in);
 
             // Set pointer in outer struct to host buffer address
             let host_ptr = host_buf.as_mut_ptr() as u64;
             outer[ptr_offset..ptr_offset + 8].copy_from_slice(&host_ptr.to_le_bytes());
 
-            // Call host ioctl
+            // Call host ioctl — paramsSize field is untouched (may be 0)
             let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, outer.as_mut_ptr()) };
             if rc < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -331,14 +319,18 @@ impl NvidiaBackend {
 
             // Build response: outer + updated nested params
             let mut combined = outer;
-            combined.extend_from_slice(&host_buf[..params_size]);
+            combined.extend_from_slice(&host_buf);
             self.write_ioctl_resp(resp_buf, cookie, &combined)
         } else {
             // No nested params — straightforward passthrough
             let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, outer.as_mut_ptr()) };
             if rc < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                tracing::warn!("nested ioctl(0x{:x}) no-params failed: errno={}", request, errno);
+                tracing::warn!(
+                    "nested ioctl(0x{:x}) no-params failed: errno={}",
+                    request,
+                    errno
+                );
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
             }
 
