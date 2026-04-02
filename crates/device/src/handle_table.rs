@@ -80,11 +80,11 @@ impl HandleTable {
     pub fn drain_all(&mut self) {
         let count = self.table.len();
         if count > 0 {
-            log::info!("HandleTable::drain_all: closing {} host fds", count);
+            tracing::info!("HandleTable::drain_all: closing {} host fds", count);
         }
         // HashMap::drain() drops each OwnedFd as it removes it.
         for (handle, fd) in self.table.drain() {
-            log::debug!(
+            tracing::debug!(
                 "  closing guest_handle={} host_fd={}",
                 handle,
                 fd.as_raw_fd()

@@ -266,7 +266,7 @@ impl ShmAllocator {
         };
         if ptr == libc::MAP_FAILED {
             let err = std::io::Error::last_os_error();
-            log::error!(
+            tracing::error!(
                 "SHM map_host_fd: mmap(offset=0x{:x}, len=0x{:x}, fd={}) failed: {}",
                 offset,
                 length,
@@ -275,7 +275,7 @@ impl ShmAllocator {
             );
             return Err(DeviceError::Io(err));
         }
-        log::debug!(
+        tracing::debug!(
             "SHM map_host_fd: mapped fd={} at offset=0x{:x} length=0x{:x}",
             host_fd,
             offset,
