@@ -229,6 +229,22 @@ impl NvidiaBackend {
             }
 
             // ---------------------------------------------------------------
+            // RM control requires nested handling
+            // ---------------------------------------------------------------
+            NV_ESC_RM_CONTROL => {
+                self.dispatch_nested(cookie, host_fd, ireq.request, param_in, resp_buf,
+                                     32, 16, 24)
+            }
+
+            // ---------------------------------------------------------------
+            // RM alloc as well..
+            // ---------------------------------------------------------------
+            NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY => {
+                self.dispatch_nested(cookie, host_fd, ireq.request, param_in, resp_buf,
+                                     48, 16, 32)
+            }
+
+            // ---------------------------------------------------------------
             // Everything else — simple passthrough to host
             //
             // This includes NV_ESC_CHECK_VERSION_STR, NV_ESC_CARD_INFO,
@@ -259,6 +275,76 @@ impl NvidiaBackend {
                 }
                 self.dispatch_simple(cookie, host_fd, ireq.request, param_in, resp_buf)
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Nested-pointer ioctl (RM_CONTROL, RM_ALLOC)
+    //
+    // Guest sends: outer_struct(zeroed ptr) + nested_params concatenated.
+    // We split them, allocate a host buffer for nested params, fix the
+    // pointer in the outer struct, call host ioctl, then send both back.
+    // ------------------------------------------------------------------
+
+    fn dispatch_nested(
+        &self,
+        cookie: u64,
+        host_fd: RawFd,
+        request: u64,
+        param_in: &[u8],
+        resp_buf: &mut [u8],
+        outer_size: usize,
+        ptr_offset: usize,
+        size_offset: usize,
+    ) -> usize {
+        if param_in.len() < outer_size {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+        }
+
+        let mut outer = param_in[..outer_size].to_vec();
+        let nested_in = &param_in[outer_size..];
+
+        let params_size = u32::from_le_bytes(
+            outer[size_offset..size_offset + 4].try_into().unwrap(),
+        ) as usize;
+
+        if params_size > 0 && !nested_in.is_empty() {
+            // Allocate host buffer, copy nested params in
+            let mut host_buf = vec![0u8; params_size];
+            let copy_len = nested_in.len().min(params_size);
+            host_buf[..copy_len].copy_from_slice(&nested_in[..copy_len]);
+
+            // Set pointer in outer struct to host buffer address
+            let host_ptr = host_buf.as_mut_ptr() as u64;
+            outer[ptr_offset..ptr_offset + 8].copy_from_slice(&host_ptr.to_le_bytes());
+
+            // Call host ioctl
+            let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, outer.as_mut_ptr()) };
+            if rc < 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                tracing::warn!("nested ioctl(0x{:x}) failed: errno={}", request, errno);
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+            }
+
+            // Zero pointer before sending back to guest
+            outer[ptr_offset..ptr_offset + 8].copy_from_slice(&0u64.to_le_bytes());
+
+            // Build response: outer + updated nested params
+            let mut combined = outer;
+            combined.extend_from_slice(&host_buf[..params_size]);
+            self.write_ioctl_resp(resp_buf, cookie, &combined)
+        } else {
+            // No nested params — straightforward passthrough
+            let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, outer.as_mut_ptr()) };
+            if rc < 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                tracing::warn!("nested ioctl(0x{:x}) no-params failed: errno={}", request, errno);
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+            }
+
+            // Zero pointer field in case host wrote something there
+            outer[ptr_offset..ptr_offset + 8].copy_from_slice(&0u64.to_le_bytes());
+            self.write_ioctl_resp(resp_buf, cookie, &outer)
         }
     }
 

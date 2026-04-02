@@ -5,8 +5,6 @@
 // This module re-exports the types that a VMM (e.g. libkrun) needs to
 // integrate virtio-gpu-nv.  The VMM implements the virtio transport and
 // calls NvidiaBackend::dispatch() for each descriptor chain.
-//
-// See INTEGRATION.md for how to wire this into libkrun.
 
 /// The virtio device ID that the guest driver probes for.
 pub const VIRTIO_ID_GPU_NV: u32 = 0x8042;

@@ -1,12 +1,6 @@
 // crates/abi/src/versions/v595_58_03.rs
 //
 // ABI table for NVIDIA driver version 595.58.03.
-//
-// All frontend ioctl parameter struct sizes verified against kernel-open
-// headers (nvos.h, nv-ioctl.h, nv_escape.h) for 595.58.03.
-//
-// Compared to 535.129.03, the only addition is NV_ESC_RM_MAP_MEMORY_DMA
-// (added in the 580 branch, inherited through 590 → 595).
 
 use crate::ioctl::*;
 
