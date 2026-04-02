@@ -314,6 +314,14 @@ impl NvidiaBackend {
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
             }
 
+            tracing::info!(
+                "dispatch_nested: escape=0x{:02x} nested_len={} rc={} outer_bytes={:02x?}",
+                (request & 0xFF),
+                nested_size,
+                rc,
+                &outer[..std::cmp::min(outer.len(), 48)]
+            );
+
             // Zero pointer before sending back to guest
             outer[ptr_offset..ptr_offset + 8].copy_from_slice(&0u64.to_le_bytes());
 
