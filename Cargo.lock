@@ -143,6 +143,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "log",
  "protocol",
  "thiserror",
  "tokio",

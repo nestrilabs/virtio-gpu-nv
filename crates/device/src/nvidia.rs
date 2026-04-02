@@ -105,7 +105,7 @@ impl NvidiaBackend {
     // ------------------------------------------------------------------
 
     pub fn teardown(&mut self) {
-        tracing::info!(
+        log::info!(
             "NvidiaBackend::teardown: draining {} handles",
             self.handles.len()
         );
@@ -128,7 +128,7 @@ impl NvidiaBackend {
             t if t == MsgType::Close as u32 => MsgType::Close,
             t if t == MsgType::Ioctl as u32 => MsgType::Ioctl,
             other => {
-                tracing::warn!("unknown msg_type {}", other);
+                log::warn!("unknown msg_type {}", other);
                 return self.write_error_resp(resp_buf, Status::InvalidMsgType, cookie, 0);
             }
         };
@@ -154,7 +154,7 @@ impl NvidiaBackend {
         let path = match device_path(req.kind, req.index) {
             Ok(p) => p,
             Err(e) => {
-                tracing::warn!("handle_open: {}", e);
+                log::warn!("handle_open: {}", e);
                 return self.write_error_resp(resp_buf, Status::InvalidDevice, cookie, 0);
             }
         };
@@ -164,12 +164,12 @@ impl NvidiaBackend {
         if raw_fd < 0 {
             let err = std::io::Error::last_os_error();
             let errno = err.raw_os_error().unwrap_or(0);
-            tracing::warn!("open({:?}) failed: {}", path, err);
+            log::warn!("open({:?}) failed: {}", path, err);
             return self.write_error_resp(resp_buf, Status::OpenFailed, cookie, errno);
         }
 
         let guest_handle = self.handles.insert(unsafe { OwnedFd::from_raw_fd(raw_fd) });
-        tracing::debug!("open {:?} → handle={}", path, guest_handle);
+        log::debug!("open {:?} → handle={}", path, guest_handle);
 
         write_ok(resp_buf, cookie, &OpenResp { guest_handle })
     }
@@ -186,7 +186,7 @@ impl NvidiaBackend {
 
         match self.handles.remove(req.guest_handle) {
             Ok(()) => {
-                tracing::debug!("close handle={}", req.guest_handle);
+                log::debug!("close handle={}", req.guest_handle);
                 write_ok(resp_buf, cookie, &CloseResp { _pad: 0 })
             }
             Err(_) => self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0),
@@ -260,7 +260,7 @@ impl NvidiaBackend {
             // Everything else — simple passthrough to host
             // ---------------------------------------------------------------
             _other => {
-                tracing::debug!(
+                log::debug!(
                     "ioctl passthrough escape=0x{:02x} size={}",
                     _other,
                     param_in.len()
@@ -310,11 +310,11 @@ impl NvidiaBackend {
             let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, outer.as_mut_ptr()) };
             if rc < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                tracing::warn!("nested ioctl(0x{:x}) failed: errno={}", request, errno);
+                log::warn!("nested ioctl(0x{:x}) failed: errno={}", request, errno);
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
             }
 
-            tracing::info!(
+            log::info!(
                 "dispatch_nested: escape=0x{:02x} nested_len={} rc={} outer_bytes={:02x?}",
                 (request & 0xFF),
                 nested_size,
@@ -334,7 +334,7 @@ impl NvidiaBackend {
             let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, outer.as_mut_ptr()) };
             if rc < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                tracing::warn!(
+                log::warn!(
                     "nested ioctl(0x{:x}) no-params failed: errno={}",
                     request,
                     errno
@@ -364,7 +364,7 @@ impl NvidiaBackend {
         let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            tracing::warn!("ioctl(0x{:x}) failed: errno={}", request, errno);
+            log::warn!("ioctl(0x{:x}) failed: errno={}", request, errno);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         }
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
@@ -408,7 +408,7 @@ impl NvidiaBackend {
         let host_embedded = match self.handles.get_raw(guest_embedded) {
             Ok(fd) => fd,
             Err(_) => {
-                tracing::warn!("fd-carrying ioctl: bad embedded handle {}", guest_embedded);
+                log::warn!("fd-carrying ioctl: bad embedded handle {}", guest_embedded);
                 return self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0);
             }
         };
@@ -420,7 +420,7 @@ impl NvidiaBackend {
 
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            tracing::warn!("fd-carrying ioctl(0x{:x}) failed: errno={}", request, errno);
+            log::warn!("fd-carrying ioctl(0x{:x}) failed: errno={}", request, errno);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         }
 
@@ -501,7 +501,7 @@ impl NvidiaBackend {
         let host_map_fd = match self.handles.get_raw(guest_fd_handle) {
             Ok(fd) => fd,
             Err(_) => {
-                tracing::warn!(
+                log::warn!(
                     "NV_ESC_RM_MAP_MEMORY: bad embedded FD handle {}",
                     guest_fd_handle
                 );
@@ -518,7 +518,7 @@ impl NvidiaBackend {
 
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            tracing::warn!("NV_ESC_RM_MAP_MEMORY: host ioctl failed: errno={}", errno);
+            log::warn!("NV_ESC_RM_MAP_MEMORY: host ioctl failed: errno={}", errno);
             // Restore guest handle before returning
             param_buf[FD_OFFSET..FD_OFFSET + 4]
                 .copy_from_slice(&(guest_fd_handle as i32).to_le_bytes());
@@ -540,7 +540,7 @@ impl NvidiaBackend {
         if rm_status != 0 {
             // RM returned an error status (NV_OK == 0).
             // Forward the params back so the guest can read the status field.
-            tracing::debug!("NV_ESC_RM_MAP_MEMORY: RM status 0x{:x}", rm_status);
+            log::debug!("NV_ESC_RM_MAP_MEMORY: RM status 0x{:x}", rm_status);
             return self.write_ioctl_resp(resp_buf, cookie, &param_buf);
         }
 
@@ -568,7 +568,7 @@ impl NvidiaBackend {
             CACHING_TYPE_WRITECOMBINED | CACHING_TYPE_DEFAULT => PgprotKind::WriteCombine,
             CACHING_TYPE_UNCACHED | CACHING_TYPE_UNCACHED_WEAK => PgprotKind::Uncached,
             other => {
-                tracing::warn!(
+                log::warn!(
                     "NV_ESC_RM_MAP_MEMORY: unknown caching type {}, defaulting to UC",
                     other
                 );
@@ -581,7 +581,7 @@ impl NvidiaBackend {
         let region = match self.shm.alloc(length, pgprot) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
+                log::error!("NV_ESC_RM_MAP_MEMORY: SHM alloc failed: {}", e);
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
             }
         };
@@ -589,11 +589,11 @@ impl NvidiaBackend {
         // --- Step 6: mmap the host fd into the SHM region ---
 
         if let Err(e) = unsafe { self.shm.map_host_fd(region.offset, length, host_map_fd) } {
-            tracing::error!("NV_ESC_RM_MAP_MEMORY: map_host_fd failed: {}", e);
+            log::error!("NV_ESC_RM_MAP_MEMORY: map_host_fd failed: {}", e);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
         }
 
-        tracing::info!(
+        log::info!(
             "NV_ESC_RM_MAP_MEMORY: allocated SHM region offset=0x{:x} length=0x{:x} pgprot={:?}",
             region.offset,
             region.length,
@@ -695,7 +695,7 @@ impl NvidiaBackend {
 impl Drop for NvidiaBackend {
     fn drop(&mut self) {
         if !self.handles.is_empty() {
-            tracing::warn!(
+            log::warn!(
                 "NvidiaBackend dropped with {} handles still open — \
                  call teardown() before dropping for clean shutdown",
                 self.handles.len()
