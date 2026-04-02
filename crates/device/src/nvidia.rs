@@ -214,51 +214,50 @@ impl NvidiaBackend {
 
         use abi::ioctl::*;
         match escape {
-            NV_ESC_CHECK_VERSION_STR
-            | NV_ESC_CARD_INFO
-            | NV_ESC_STATUS_CODE
-            | NV_ESC_RM_FREE
-            | NV_ESC_RM_UNMAP_MEMORY
-            | NV_ESC_RM_DUP_OBJECT
-            | NV_ESC_RM_SHARE
-            | NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO => {
-                self.dispatch_simple(cookie, host_fd, ireq.request, param_in, resp_buf)
-            }
-
+            // ---------------------------------------------------------------
+            // FD-carrying ioctls — need handle translation
+            // ---------------------------------------------------------------
             NV_ESC_REGISTER_FD | NV_ESC_ALLOC_OS_EVENT | NV_ESC_FREE_OS_EVENT => {
                 self.dispatch_fd_carrying(cookie, host_fd, ireq.request, escape, param_in, resp_buf)
             }
 
+            // ---------------------------------------------------------------
+            // Map memory — needs FD translation + SHM allocation
+            // ---------------------------------------------------------------
             NV_ESC_RM_MAP_MEMORY => {
                 self.dispatch_map_memory(cookie, host_fd, ireq.request, param_in, resp_buf)
             }
 
-            NV_ESC_RM_MAP_MEMORY_DMA => {
-                tracing::debug!("NV_ESC_RM_MAP_MEMORY_DMA: pass-through");
-                self.dispatch_simple(cookie, host_fd, ireq.request, param_in, resp_buf)
-            }
-
             // ---------------------------------------------------------------
-            // Nested-dispatch ioctls — pass through to host for now.
+            // Everything else — simple passthrough to host
             //
-            // Phase 3 TODO: parse NVOS64_PARAMETERS to extract hClass
-            // (RM_ALLOC) or NVOS54_PARAMETERS to extract cmd (RM_CONTROL)
-            // for per-class/per-cmd validation and object tracking.
-            // For now, forward as simple ioctls so Vulkan init can proceed.
+            // This includes NV_ESC_CHECK_VERSION_STR, NV_ESC_CARD_INFO,
+            // NV_ESC_SYS_PARAMS, NV_ESC_ATTACH_GPUS_TO_FD,
+            // NV_ESC_WAIT_OPEN_COMPLETE, all RM escapes, etc.
+            //
+            // Only ioctls that carry embedded FDs or need SHM handling
+            // require special dispatch above.
             // ---------------------------------------------------------------
-            NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY => {
-                tracing::debug!("NV_ESC_RM_ALLOC (0x{:02x}): pass-through", escape);
-                self.dispatch_simple(cookie, host_fd, ireq.request, param_in, resp_buf)
-            }
-
-            NV_ESC_RM_CONTROL => {
-                tracing::debug!("NV_ESC_RM_CONTROL: pass-through");
-                self.dispatch_simple(cookie, host_fd, ireq.request, param_in, resp_buf)
-            }
-
             other => {
-                tracing::warn!("unhandled ioctl escape 0x{:02x}", other);
-                self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOTTY)
+                if tracing::enabled!(tracing::Level::TRACE) {
+                    tracing::trace!(
+                        "ioctl passthrough escape=0x{:02x} size={}",
+                        other,
+                        param_in.len()
+                    );
+                } else if other != NV_ESC_CHECK_VERSION_STR
+                    && other != NV_ESC_CARD_INFO
+                    && other != NV_ESC_RM_ALLOC
+                    && other != NV_ESC_RM_CONTROL
+                    && other != NV_ESC_RM_FREE
+                {
+                    tracing::debug!(
+                        "ioctl passthrough escape=0x{:02x} size={}",
+                        other,
+                        param_in.len()
+                    );
+                }
+                self.dispatch_simple(cookie, host_fd, ireq.request, param_in, resp_buf)
             }
         }
     }
