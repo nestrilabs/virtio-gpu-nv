@@ -330,7 +330,11 @@ impl NvidiaBackend {
             } else if escape == 0x2b {
                 let status = u32::from_le_bytes(outer[40..44].try_into().unwrap());
                 let hclass = u32::from_le_bytes(outer[12..16].try_into().unwrap());
-                log::info!("(if) RM_ALLOC hClass=0x{:04x} status=0x{:x}", hclass, status);
+                log::info!(
+                    "(if) RM_ALLOC hClass=0x{:04x} status=0x{:x}",
+                    hclass,
+                    status
+                );
                 if hclass == 0x90f1 {
                     log::info!("  VASPACE nested_in={:02x?}", nested_in);
                     log::info!("  VASPACE host_buf={:02x?}", &host_buf[..]);
@@ -366,7 +370,11 @@ impl NvidiaBackend {
             } else if escape == 0x2b {
                 let status = u32::from_le_bytes(outer[40..44].try_into().unwrap());
                 let hclass = u32::from_le_bytes(outer[12..16].try_into().unwrap());
-                log::info!("(else) RM_ALLOC hClass=0x{:04x} status=0x{:x}", hclass, status);
+                log::info!(
+                    "(else) RM_ALLOC hClass=0x{:04x} status=0x{:x}",
+                    hclass,
+                    status
+                );
             }
 
             // Zero pointer field in case host wrote something there
@@ -393,6 +401,15 @@ impl NvidiaBackend {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             log::warn!("ioctl(0x{:x}) failed: errno={}", request, errno);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+        } else {
+            let escape = (request & 0xFF) as u32;
+            if escape == 0xd4 || escape == 0x4a {
+                log::info!(
+                    "dispatch_simple: escape=0x{:02x} succeeded, response={:02x?}",
+                    escape,
+                    &param_buf[..std::cmp::min(param_buf.len(), 64)]
+                );
+            }
         }
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
