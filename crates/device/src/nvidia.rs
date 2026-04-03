@@ -322,16 +322,15 @@ impl NvidiaBackend {
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
             }
 
-            if (request & 0xFF) == 0x2a {
+            let escape = (request & 0xFF) as u32;
+            if escape == 0x2a {
                 let status = u32::from_le_bytes(outer[28..32].try_into().unwrap());
                 let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
-                if status != 0 {
-                    log::warn!(
-                        "RM_CONTROL cmd=0x{:08x} returned status=0x{:x}",
-                        cmd,
-                        status
-                    );
-                }
+                log::info!("(if) RM_CONTROL cmd=0x{:08x} status=0x{:x}", cmd, status);
+            } else if escape == 0x2b {
+                let status = u32::from_le_bytes(outer[40..44].try_into().unwrap());
+                let hclass = u32::from_le_bytes(outer[12..16].try_into().unwrap());
+                log::info!("(if) RM_ALLOC hClass=0x{:04x} status=0x{:x}", hclass, status);
             }
 
             // Zero pointer before sending back to guest
@@ -352,6 +351,17 @@ impl NvidiaBackend {
                     errno
                 );
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+            }
+
+            let escape = (request & 0xFF) as u32;
+            if escape == 0x2a {
+                let status = u32::from_le_bytes(outer[28..32].try_into().unwrap());
+                let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
+                log::info!("(else) RM_CONTROL cmd=0x{:08x} status=0x{:x}", cmd, status);
+            } else if escape == 0x2b {
+                let status = u32::from_le_bytes(outer[40..44].try_into().unwrap());
+                let hclass = u32::from_le_bytes(outer[12..16].try_into().unwrap());
+                log::info!("(else) RM_ALLOC hClass=0x{:04x} status=0x{:x}", hclass, status);
             }
 
             // Zero pointer field in case host wrote something there
