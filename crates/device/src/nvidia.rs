@@ -212,6 +212,14 @@ impl NvidiaBackend {
 
         let escape = (ireq.request & 0xFF) as u32;
 
+        log::info!(
+            "IOCTL: handle={} escape=0x{:02x} req=0x{:x} param_size={}",
+            ireq.guest_handle,
+            escape,
+            ireq.request,
+            ireq.param_size
+        );
+
         use abi::ioctl::*;
         match escape {
             // ---------------------------------------------------------------
@@ -313,14 +321,6 @@ impl NvidiaBackend {
                 log::warn!("nested ioctl(0x{:x}) failed: errno={}", request, errno);
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
             }
-
-            log::info!(
-                "dispatch_nested: escape=0x{:02x} nested_len={} rc={} outer_bytes={:02x?}",
-                (request & 0xFF),
-                nested_size,
-                rc,
-                &outer[..std::cmp::min(outer.len(), 48)]
-            );
 
             if (request & 0xFF) == 0x2a {
                 let status = u32::from_le_bytes(outer[28..32].try_into().unwrap());
