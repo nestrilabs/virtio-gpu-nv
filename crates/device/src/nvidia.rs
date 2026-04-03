@@ -212,7 +212,7 @@ impl NvidiaBackend {
 
         let escape = (ireq.request & 0xFF) as u32;
 
-        log::info!(
+        log::trace!(
             "IOCTL: handle={} escape=0x{:02x} req=0x{:x} param_size={}",
             ireq.guest_handle,
             escape,
@@ -268,6 +268,16 @@ impl NvidiaBackend {
             // Everything else — simple passthrough to host
             // ---------------------------------------------------------------
             _other => {
+                // Catch dedicated EXPORT/IMPORT escapes (0x5C, 0x5D) if the
+                // library uses them instead of (or in addition to) RM_CONTROL.
+                if _other == 0x5C || _other == 0x5D {
+                    log::info!(
+                        ">>> DEDICATED EXPORT/IMPORT escape=0x{:02x} param_size={} param_in={:02x?}",
+                        _other,
+                        param_in.len(),
+                        &param_in[..std::cmp::min(param_in.len(), 64)]
+                    );
+                }
                 log::debug!(
                     "ioctl passthrough escape=0x{:02x} size={}",
                     _other,
@@ -304,11 +314,93 @@ impl NvidiaBackend {
         let mut outer = param_in[..outer_size].to_vec();
         let nested_in = &param_in[outer_size..];
 
+        let escape = (request & 0xFF) as u32;
+
         if !nested_in.is_empty() {
             // Guest sent nested params — allocate host buffer, point struct at it
             let nested_size = nested_in.len();
             let mut host_buf = vec![0u8; nested_size];
             host_buf.copy_from_slice(nested_in);
+
+            // ============ DIAGNOSTIC: fd-carrying RM_CONTROLs ============
+            if escape == 0x2A && outer.len() >= 12 {
+                let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
+                if cmd == 0x3d05 || cmd == 0x3d06 {
+                    log::info!(">>> FD-carrying RM_CONTROL cmd=0x{:04x}", cmd);
+                    log::info!("    outer ({} bytes) = {:02x?}", outer.len(), &outer[..]);
+                    log::info!(
+                        "    nested_in ({} bytes) = {:02x?}",
+                        nested_in.len(),
+                        nested_in
+                    );
+
+                    if cmd == 0x3d05 && nested_in.len() >= 20 {
+                        // NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS layout:
+                        //   0: object.type  (u32)
+                        //   4: object.data.rmObject.hDevice  (u32)
+                        //   8: object.data.rmObject.hParent  (u32)
+                        //  12: object.data.rmObject.hObject  (u32)
+                        //  16: fd           (i32)
+                        //  20: flags        (u32)
+                        let obj_type = u32::from_le_bytes(nested_in[0..4].try_into().unwrap());
+                        let h_device = u32::from_le_bytes(nested_in[4..8].try_into().unwrap());
+                        let h_parent = u32::from_le_bytes(nested_in[8..12].try_into().unwrap());
+                        let h_object = u32::from_le_bytes(nested_in[12..16].try_into().unwrap());
+                        let fd_val = i32::from_le_bytes(nested_in[16..20].try_into().unwrap());
+                        let flags = if nested_in.len() >= 24 {
+                            u32::from_le_bytes(nested_in[20..24].try_into().unwrap())
+                        } else {
+                            0
+                        };
+                        log::info!(
+                            "    EXPORT_TO_FD: type={} hDevice=0x{:x} hParent=0x{:x} \
+                         hObject=0x{:x} fd={} flags=0x{:x}",
+                            obj_type,
+                            h_device,
+                            h_parent,
+                            h_object,
+                            fd_val,
+                            flags
+                        );
+                        // Is this a raw guest fd number or already a guest_handle?
+                        if fd_val > 0 {
+                            match self.handles.get_raw(fd_val as u64) {
+                                Ok(real_fd) => log::info!(
+                                    "    fd={} RESOLVES as guest_handle → host_fd={}",
+                                    fd_val,
+                                    real_fd
+                                ),
+                                Err(_) => log::info!(
+                                    "    fd={} does NOT resolve as guest_handle (raw guest fd?)",
+                                    fd_val
+                                ),
+                            }
+                        }
+                    }
+
+                    if cmd == 0x3d06 && nested_in.len() >= 4 {
+                        // NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS layout:
+                        //   0: fd           (i32)
+                        //   4: object.type  (u32)
+                        //   8: object.data  (12 bytes)
+                        let fd_val = i32::from_le_bytes(nested_in[0..4].try_into().unwrap());
+                        log::info!("    IMPORT_FROM_FD: fd={}", fd_val);
+                        if fd_val > 0 {
+                            match self.handles.get_raw(fd_val as u64) {
+                                Ok(real_fd) => log::info!(
+                                    "    fd={} RESOLVES as guest_handle → host_fd={}",
+                                    fd_val,
+                                    real_fd
+                                ),
+                                Err(_) => {
+                                    log::info!("    fd={} does NOT resolve as guest_handle", fd_val)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // ============ END DIAGNOSTIC ============
 
             // Set pointer in outer struct to host buffer address
             let host_ptr = host_buf.as_mut_ptr() as u64;
@@ -322,23 +414,37 @@ impl NvidiaBackend {
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
             }
 
-            let escape = (request & 0xFF) as u32;
+            // ============ DIAGNOSTIC: post-ioctl for 0x3d05/0x3d06 ============
+            if escape == 0x2A && outer.len() >= 32 {
+                let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
+                if cmd == 0x3d05 || cmd == 0x3d06 {
+                    let status = u32::from_le_bytes(outer[28..32].try_into().unwrap());
+                    log::info!("    POST-IOCTL cmd=0x{:04x}: RM status=0x{:x}", cmd, status);
+                    log::info!(
+                        "    POST-IOCTL host_buf ({} bytes) = {:02x?}",
+                        host_buf.len(),
+                        &host_buf[..]
+                    );
+                }
+            }
+            // ============ END DIAGNOSTIC ============
+
             if escape == 0x2a {
                 let status = u32::from_le_bytes(outer[28..32].try_into().unwrap());
                 let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
-                log::info!("(if) RM_CONTROL cmd=0x{:08x} status=0x{:x}", cmd, status);
+                log::debug!("(if) RM_CONTROL cmd=0x{:08x} status=0x{:x}", cmd, status);
             } else if escape == 0x2b {
                 let status = u32::from_le_bytes(outer[40..44].try_into().unwrap());
                 let hclass = u32::from_le_bytes(outer[12..16].try_into().unwrap());
-                log::info!(
+                log::debug!(
                     "(if) RM_ALLOC hClass=0x{:04x} status=0x{:x}",
                     hclass,
                     status
                 );
                 if hclass == 0x90f1 {
-                    log::info!("  VASPACE nested_in={:02x?}", nested_in);
-                    log::info!("  VASPACE host_buf={:02x?}", &host_buf[..]);
-                    log::info!("  VASPACE outer={:02x?}", &outer[..]);
+                    log::debug!("  VASPACE nested_in={:02x?}", nested_in);
+                    log::debug!("  VASPACE host_buf={:02x?}", &host_buf[..]);
+                    log::debug!("  VASPACE outer={:02x?}", &outer[..]);
                 }
             }
 
@@ -366,11 +472,11 @@ impl NvidiaBackend {
             if escape == 0x2a {
                 let status = u32::from_le_bytes(outer[28..32].try_into().unwrap());
                 let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
-                log::info!("(else) RM_CONTROL cmd=0x{:08x} status=0x{:x}", cmd, status);
+                log::debug!("(else) RM_CONTROL cmd=0x{:08x} status=0x{:x}", cmd, status);
             } else if escape == 0x2b {
                 let status = u32::from_le_bytes(outer[40..44].try_into().unwrap());
                 let hclass = u32::from_le_bytes(outer[12..16].try_into().unwrap());
-                log::info!(
+                log::debug!(
                     "(else) RM_ALLOC hClass=0x{:04x} status=0x{:x}",
                     hclass,
                     status
