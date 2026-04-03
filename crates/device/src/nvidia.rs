@@ -331,6 +331,11 @@ impl NvidiaBackend {
                 let status = u32::from_le_bytes(outer[40..44].try_into().unwrap());
                 let hclass = u32::from_le_bytes(outer[12..16].try_into().unwrap());
                 log::info!("(if) RM_ALLOC hClass=0x{:04x} status=0x{:x}", hclass, status);
+                if hclass == 0x90f1 {
+                    log::info!("  VASPACE nested_in={:02x?}", nested_in);
+                    log::info!("  VASPACE host_buf={:02x?}", &host_buf[..]);
+                    log::info!("  VASPACE outer={:02x?}", &outer[..]);
+                }
             }
 
             // Zero pointer before sending back to guest
