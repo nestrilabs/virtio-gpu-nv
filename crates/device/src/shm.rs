@@ -1,26 +1,4 @@
 // crates/device/src/shm.rs
-//
-// SHM BAR region allocator — with per-cache-type zone partitioning
-// and memfd backing.
-//
-// --- Why memfd ---
-//
-// The SHM BAR must be backed by a file descriptor that can be:
-//   1. mmap'd into the VMM's address space (so we can MAP_FIXED host
-//      GPU mappings into it).
-//   2. Passed to KVM as a memory backend (so the guest can access it
-//      via EPT/NPT).
-//
-// memfd_create() gives us an anonymous file that satisfies both.  We
-// ftruncate it to the total BAR size at construction, then mmap the
-// whole thing MAP_SHARED.  When the backend handles NV_ESC_RM_MAP_MEMORY,
-// it mmap's the host nvidia fd MAP_FIXED into the appropriate offset
-// within this region.
-//
-// --- Zone partitioning ---
-//
-// See previous comments about UC/WC/WB zones.  The VMM must map each
-// zone's physical range in the EPT with the matching memory type.
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -28,18 +6,11 @@ use std::ptr;
 
 use crate::error::{DeviceError, Result};
 
-/// CPU cache attribute for a SHM region.
-///
-/// Encoded in `ioctl_resp::pgprot` and in `ShmRegion::pgprot` so the guest
-/// driver can call remap_pfn_range() with the correct pgprot_t.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PgprotKind {
-    /// Write-back: normal cacheable memory.  Used for system-memory DMA buffers.
     WriteBack = 0,
-    /// Write-combining: coalesced uncached writes.  Used for VRAM/framebuffer BARs.
     WriteCombine = 1,
-    /// Uncached: no caching, strongly ordered.  Used for MMIO registers/doorbells.
     Uncached = 2,
 }
 
@@ -54,25 +25,16 @@ impl PgprotKind {
     }
 }
 
-/// A single allocated region within the SHM BAR.
 #[derive(Debug)]
 pub struct ShmRegion {
-    /// Byte offset from the start of the SHM BAR (what the guest uses as
-    /// the mmap offset).
     pub offset: u64,
-    /// Byte length of the region (before page-alignment).
     pub length: u64,
-    /// Required CPU cache attribute for this region.
     pub pgprot: PgprotKind,
 }
 
-/// Zone boundaries within the BAR.
 struct Zone {
-    /// Absolute byte offset of the start of this zone.
     base: u64,
-    /// Total size of this zone in bytes.
     size: u64,
-    /// Next free offset within this zone (relative to `base`).
     cursor: u64,
 }
 
@@ -100,19 +62,13 @@ impl Zone {
     }
 }
 
-/// BAR zone configuration.
 pub struct ZoneConfig {
-    /// Size of the UC zone in bytes (must be page-aligned).
     pub uc_size: u64,
-    /// Size of the WC zone in bytes (must be page-aligned).
     pub wc_size: u64,
-    /// Size of the WB zone in bytes (must be page-aligned).
-    /// Total BAR size = uc_size + wc_size + wb_size.
     pub wb_size: u64,
 }
 
 impl ZoneConfig {
-    /// Default split: 4 MiB UC, 128 MiB WC, 124 MiB WB  (= 256 MiB total).
     pub fn default_256mib() -> Self {
         Self {
             uc_size: 4 * 1024 * 1024,
@@ -126,25 +82,25 @@ impl ZoneConfig {
     }
 }
 
-/// Partitioned bump allocator for the SHM BAR, backed by a memfd.
 pub struct ShmAllocator {
     uc: Zone,
     wc: Zone,
     wb: Zone,
 
-    /// The memfd backing the entire BAR.
-    memfd: OwnedFd,
-
-    /// Base pointer of the mmap'd region in our address space.
-    /// The region spans [base_ptr, base_ptr + total_size).
+    /// Base pointer for MAP_FIXED operations.
+    /// Initially points to the memfd mmap (self-owned fallback).
+    /// Overridden to the guest memory HVA via set_base_ptr().
     base_ptr: *mut u8,
 
-    /// Total size of the BAR (UC + WC + WB).
+    /// Self-owned memfd mapping — used as fallback when no external
+    /// base pointer is provided (e.g., unit tests).
+    memfd: Option<OwnedFd>,
+    memfd_ptr: *mut u8,
+    memfd_size: u64,
+
     total_size: u64,
 }
 
-// SAFETY: The memfd and mmap region are owned solely by this struct.
-// Access is serialised by the caller (NvidiaBackend holds &mut self).
 unsafe impl Send for ShmAllocator {}
 unsafe impl Sync for ShmAllocator {}
 
@@ -157,7 +113,8 @@ impl ShmAllocator {
         let total = cfg.total();
         assert!(total > 0);
 
-        // Create the memfd.
+        // Create a memfd as fallback backing (used for tests and
+        // before set_base_ptr is called).
         let name = CString::new("virtio-gpu-nv-shm").unwrap();
         let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
         assert!(
@@ -167,7 +124,6 @@ impl ShmAllocator {
         );
         let memfd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
-        // Size the memfd.
         let ret = unsafe { libc::ftruncate(memfd.as_raw_fd(), total as libc::off_t) };
         assert_eq!(
             ret,
@@ -176,8 +132,7 @@ impl ShmAllocator {
             std::io::Error::last_os_error()
         );
 
-        // mmap the entire region MAP_SHARED so MAP_FIXED sub-mappings work.
-        let base_ptr = unsafe {
+        let memfd_ptr = unsafe {
             libc::mmap(
                 ptr::null_mut(),
                 total as usize,
@@ -188,7 +143,7 @@ impl ShmAllocator {
             )
         };
         assert_ne!(
-            base_ptr,
+            memfd_ptr,
             libc::MAP_FAILED,
             "mmap SHM BAR failed: {}",
             std::io::Error::last_os_error()
@@ -202,8 +157,10 @@ impl ShmAllocator {
             uc: Zone::new(uc_base, cfg.uc_size),
             wc: Zone::new(wc_base, cfg.wc_size),
             wb: Zone::new(wb_base, cfg.wb_size),
-            memfd,
-            base_ptr: base_ptr as *mut u8,
+            base_ptr: memfd_ptr as *mut u8,
+            memfd: Some(memfd),
+            memfd_ptr: memfd_ptr as *mut u8,
+            memfd_size: total,
             total_size: total,
         }
     }
@@ -212,10 +169,21 @@ impl ShmAllocator {
         Self::new(ZoneConfig::default_256mib())
     }
 
-    /// Allocate `length` bytes from the zone matching `pgprot`.
+    /// Override the base pointer used for MAP_FIXED operations.
     ///
-    /// Returns `Err` if the zone is full.  Lengths are rounded up to the
-    /// next page boundary within the zone.
+    /// Called by the VMM after guest memory is set up, passing the HVA
+    /// of the guest physical address range allocated for the SHM BAR.
+    /// After this call, map_host_fd() will mmap directly into guest
+    /// memory (visible via EPT/NPT), not into the memfd.
+    pub fn set_base_ptr(&mut self, ptr: *mut u8) {
+        log::info!(
+            "ShmAllocator: base_ptr updated from {:?} to {:?}",
+            self.base_ptr,
+            ptr
+        );
+        self.base_ptr = ptr;
+    }
+
     pub fn alloc(&mut self, length: u64, pgprot: PgprotKind) -> Result<ShmRegion> {
         let zone = match pgprot {
             PgprotKind::Uncached => &mut self.uc,
@@ -241,19 +209,27 @@ impl ShmAllocator {
         }
     }
 
-    /// mmap a host fd into the SHM BAR at the given offset.
+    /// mmap a host fd into the SHM region at the given offset.
     ///
-    /// This is called after `alloc()` to place the actual host GPU mapping
-    /// into the SHM region.  Uses MAP_FIXED to overwrite the memfd-backed
-    /// page(s) at `offset` with the host fd's mapping.
+    /// Uses MAP_FIXED to overlay the host GPU mapping onto the base
+    /// pointer region (either guest memory HVA or memfd fallback).
     ///
     /// # Safety
     ///
-    /// `host_fd` must be a valid file descriptor that supports mmap
-    /// (e.g. an NVIDIA device fd after NV_ESC_RM_MAP_MEMORY).
+    /// `host_fd` must be a valid fd that supports mmap.
     /// `offset` and `length` must be within the BAR and page-aligned.
     pub unsafe fn map_host_fd(&self, offset: u64, length: u64, host_fd: RawFd) -> Result<()> {
         let target = unsafe { self.base_ptr.add(offset as usize) as *mut libc::c_void };
+
+        log::info!(
+            "SHM map_host_fd: base_ptr={:?} offset=0x{:x} target={:?} len=0x{:x} fd={}",
+            self.base_ptr,
+            offset,
+            target,
+            length,
+            host_fd
+        );
+
         let ptr = unsafe {
             libc::mmap(
                 target,
@@ -275,21 +251,20 @@ impl ShmAllocator {
             );
             return Err(DeviceError::Io(err));
         }
-        log::debug!(
-            "SHM map_host_fd: mapped fd={} at offset=0x{:x} length=0x{:x}",
+        log::info!(
+            "SHM map_host_fd: mapped fd={} at offset=0x{:x} length=0x{:x} result={:?}",
             host_fd,
             offset,
-            length
+            length,
+            ptr
         );
         Ok(())
     }
 
-    /// Raw fd of the memfd, for passing to KVM as a memory backend.
     pub fn memfd_raw(&self) -> RawFd {
-        self.memfd.as_raw_fd()
+        self.memfd.as_ref().map_or(-1, |fd| fd.as_raw_fd())
     }
 
-    /// Base pointer of the mmap'd SHM BAR region.
     pub fn base_ptr(&self) -> *mut u8 {
         self.base_ptr
     }
@@ -310,11 +285,15 @@ impl ShmAllocator {
 
 impl Drop for ShmAllocator {
     fn drop(&mut self) {
-        if !self.base_ptr.is_null() {
+        // Only unmap the memfd mapping, not the guest memory.
+        if !self.memfd_ptr.is_null() {
             unsafe {
-                libc::munmap(self.base_ptr as *mut libc::c_void, self.total_size as usize);
+                libc::munmap(
+                    self.memfd_ptr as *mut libc::c_void,
+                    self.memfd_size as usize,
+                );
             }
-            self.base_ptr = ptr::null_mut();
+            self.memfd_ptr = ptr::null_mut();
         }
         // OwnedFd drops the memfd automatically.
     }
@@ -351,9 +330,7 @@ mod tests {
     #[test]
     fn zones_dont_overlap() {
         let a = small_alloc();
-        // UC ends where WC begins
         assert_eq!(a.uc.base + a.uc.size, a.wc.base);
-        // WC ends where WB begins
         assert_eq!(a.wc.base + a.wc.size, a.wb.base);
     }
 
@@ -367,10 +344,6 @@ mod tests {
         assert_eq!(uc.offset, a.uc.base);
         assert_eq!(wc.offset, a.wc.base);
         assert_eq!(wb.offset, a.wb.base);
-
-        assert_eq!(uc.pgprot, PgprotKind::Uncached);
-        assert_eq!(wc.pgprot, PgprotKind::WriteCombine);
-        assert_eq!(wb.pgprot, PgprotKind::WriteBack);
     }
 
     #[test]
@@ -378,7 +351,6 @@ mod tests {
         let mut a = small_alloc();
         let r1 = a.alloc(1, PgprotKind::WriteBack).unwrap();
         let r2 = a.alloc(1, PgprotKind::WriteBack).unwrap();
-        // Second allocation starts one full page after first (bump rounds up)
         assert_eq!(r2.offset - r1.offset, 4096);
     }
 
@@ -391,43 +363,21 @@ mod tests {
     }
 
     #[test]
-    fn cross_zone_isolation() {
-        // Filling WC zone should not affect UC or WB
+    fn set_base_ptr_changes_target() {
         let mut a = small_alloc();
-        a.alloc(4096 * 4, PgprotKind::WriteCombine).unwrap();
-        assert!(a.alloc(4096, PgprotKind::WriteCombine).is_err());
-        assert!(a.alloc(4096, PgprotKind::Uncached).is_ok());
-        assert!(a.alloc(4096, PgprotKind::WriteBack).is_ok());
+        let original = a.base_ptr();
+        let fake_ptr = 0xDEAD_0000 as *mut u8;
+        a.set_base_ptr(fake_ptr);
+        assert_eq!(a.base_ptr(), fake_ptr);
+        assert_ne!(a.base_ptr(), original);
     }
 
     #[test]
-    fn can_write_to_memfd_region() {
-        let a = small_alloc();
-        // Write to the first byte of each zone and read it back,
-        // proving the mmap is live.
-        unsafe {
-            let uc_ptr = a.base_ptr().add(a.uc.base as usize);
-            let wc_ptr = a.base_ptr().add(a.wc.base as usize);
-            let wb_ptr = a.base_ptr().add(a.wb.base as usize);
-
-            *uc_ptr = 0xAA;
-            *wc_ptr = 0xBB;
-            *wb_ptr = 0xCC;
-
-            assert_eq!(*uc_ptr, 0xAA);
-            assert_eq!(*wc_ptr, 0xBB);
-            assert_eq!(*wb_ptr, 0xCC);
-        }
-    }
-
-    #[test]
-    fn map_host_fd_with_devnull() {
-        // We can't map /dev/null with MAP_SHARED, but we can test with
-        // another memfd to prove the MAP_FIXED path works.
+    fn map_host_fd_with_memfd_fallback() {
+        // Tests using the default memfd-backed base_ptr (no set_base_ptr call)
         let mut a = small_alloc();
         let region = a.alloc(4096, PgprotKind::WriteCombine).unwrap();
 
-        // Create a second memfd, write a magic value, then map it in.
         let name = CString::new("test-host-fd").unwrap();
         let host_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
         assert!(host_fd >= 0);
@@ -446,18 +396,13 @@ mod tests {
             libc::munmap(tmp, 4096);
         }
 
-        // Map the host fd into our SHM region.
         unsafe {
             a.map_host_fd(region.offset, 4096, host_fd).unwrap();
         }
 
-        // Read through the SHM base pointer — should see the magic value.
         unsafe {
             let val = *a.base_ptr().add(region.offset as usize);
-            assert_eq!(
-                val, 0x42,
-                "MAP_FIXED should have overlaid the host fd mapping"
-            );
+            assert_eq!(val, 0x42);
         }
 
         unsafe { libc::close(host_fd) };

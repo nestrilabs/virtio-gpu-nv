@@ -83,6 +83,12 @@ impl NvidiaBackend {
         self.shm.base_ptr()
     }
 
+    /// Override the SHM base pointer to the guest memory HVA.
+    /// Called by the VMM after guest memory setup.
+    pub fn set_shm_base(&mut self, ptr: *mut u8) {
+        self.shm.set_base_ptr(ptr);
+    }
+
     /// Create a minimal backend suitable for unit tests (8-page total BAR).
     #[cfg(test)]
     pub fn for_test() -> Self {
