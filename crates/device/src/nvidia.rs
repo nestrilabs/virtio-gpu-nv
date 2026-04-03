@@ -289,11 +289,7 @@ impl NvidiaBackend {
     }
 
     // ------------------------------------------------------------------
-    // Nested-pointer ioctl (RM_CONTROL, RM_ALLOC)
-    //
-    // Guest sends: outer_struct(zeroed ptr) + nested_params concatenated.
-    // We split them, allocate a host buffer for nested params, fix the
-    // pointer in the outer struct, call host ioctl, then send both back.
+    // Nested-pointer ioctl (RM_CONTROL, RM_ALLOC..)
     // ------------------------------------------------------------------
 
     fn dispatch_nested(
@@ -322,85 +318,60 @@ impl NvidiaBackend {
             let mut host_buf = vec![0u8; nested_size];
             host_buf.copy_from_slice(nested_in);
 
-            // ============ DIAGNOSTIC: fd-carrying RM_CONTROLs ============
+            // ---------------------------------------------------------------
+            // Translate guest_handle → host fd for fd-carrying RM_CONTROLs
+            //
+            // The guest driver already translated the raw guest fd to a
+            // guest_handle. We now translate that handle to a real host fd
+            // so the host kernel can resolve it.
+            // ---------------------------------------------------------------
+            let mut saved_nested_handle: Option<(usize, i32)> = None; // (offset, guest_handle_as_i32)
+
             if escape == 0x2A && outer.len() >= 12 {
                 let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
-                if cmd == 0x3d05 || cmd == 0x3d06 {
-                    log::info!(">>> FD-carrying RM_CONTROL cmd=0x{:04x}", cmd);
-                    log::info!("    outer ({} bytes) = {:02x?}", outer.len(), &outer[..]);
-                    log::info!(
-                        "    nested_in ({} bytes) = {:02x?}",
-                        nested_in.len(),
-                        nested_in
-                    );
 
-                    if cmd == 0x3d05 && nested_in.len() >= 20 {
-                        // NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS layout:
-                        //   0: object.type  (u32)
-                        //   4: object.data.rmObject.hDevice  (u32)
-                        //   8: object.data.rmObject.hParent  (u32)
-                        //  12: object.data.rmObject.hObject  (u32)
-                        //  16: fd           (i32)
-                        //  20: flags        (u32)
-                        let obj_type = u32::from_le_bytes(nested_in[0..4].try_into().unwrap());
-                        let h_device = u32::from_le_bytes(nested_in[4..8].try_into().unwrap());
-                        let h_parent = u32::from_le_bytes(nested_in[8..12].try_into().unwrap());
-                        let h_object = u32::from_le_bytes(nested_in[12..16].try_into().unwrap());
-                        let fd_val = i32::from_le_bytes(nested_in[16..20].try_into().unwrap());
-                        let flags = if nested_in.len() >= 24 {
-                            u32::from_le_bytes(nested_in[20..24].try_into().unwrap())
-                        } else {
-                            0
-                        };
-                        log::info!(
-                            "    EXPORT_TO_FD: type={} hDevice=0x{:x} hParent=0x{:x} \
-                         hObject=0x{:x} fd={} flags=0x{:x}",
-                            obj_type,
-                            h_device,
-                            h_parent,
-                            h_object,
-                            fd_val,
-                            flags
-                        );
-                        // Is this a raw guest fd number or already a guest_handle?
-                        if fd_val > 0 {
-                            match self.handles.get_raw(fd_val as u64) {
-                                Ok(real_fd) => log::info!(
-                                    "    fd={} RESOLVES as guest_handle → host_fd={}",
-                                    fd_val,
-                                    real_fd
-                                ),
-                                Err(_) => log::info!(
-                                    "    fd={} does NOT resolve as guest_handle (raw guest fd?)",
-                                    fd_val
-                                ),
-                            }
+                if cmd == 0x3d05 && host_buf.len() >= 20 {
+                    // EXPORT_OBJECT_TO_FD: guest_handle at offset 16 in nested
+                    let guest_handle_val = i32::from_le_bytes(host_buf[16..20].try_into().unwrap());
+
+                    match self.handles.get_raw(guest_handle_val as u64) {
+                        Ok(real_fd) => {
+                            log::debug!(
+                                "EXPORT_TO_FD: handle {} → host fd {}",
+                                guest_handle_val,
+                                real_fd
+                            );
+                            saved_nested_handle = Some((16, guest_handle_val));
+                            host_buf[16..20].copy_from_slice(&(real_fd as i32).to_le_bytes());
+                        }
+                        Err(_) => {
+                            log::warn!("EXPORT_TO_FD: bad guest_handle {}", guest_handle_val);
+                            return self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0);
                         }
                     }
+                }
 
-                    if cmd == 0x3d06 && nested_in.len() >= 4 {
-                        // NV0000_CTRL_OS_UNIX_IMPORT_OBJECT_FROM_FD_PARAMS layout:
-                        //   0: fd           (i32)
-                        //   4: object.type  (u32)
-                        //   8: object.data  (12 bytes)
-                        let fd_val = i32::from_le_bytes(nested_in[0..4].try_into().unwrap());
-                        log::info!("    IMPORT_FROM_FD: fd={}", fd_val);
-                        if fd_val > 0 {
-                            match self.handles.get_raw(fd_val as u64) {
-                                Ok(real_fd) => log::info!(
-                                    "    fd={} RESOLVES as guest_handle → host_fd={}",
-                                    fd_val,
-                                    real_fd
-                                ),
-                                Err(_) => {
-                                    log::info!("    fd={} does NOT resolve as guest_handle", fd_val)
-                                }
-                            }
+                if cmd == 0x3d06 && host_buf.len() >= 4 {
+                    // IMPORT_OBJECT_FROM_FD: guest_handle at offset 0 in nested
+                    let guest_handle_val = i32::from_le_bytes(host_buf[0..4].try_into().unwrap());
+
+                    match self.handles.get_raw(guest_handle_val as u64) {
+                        Ok(real_fd) => {
+                            log::debug!(
+                                "IMPORT_FROM_FD: handle {} → host fd {}",
+                                guest_handle_val,
+                                real_fd
+                            );
+                            saved_nested_handle = Some((0, guest_handle_val));
+                            host_buf[0..4].copy_from_slice(&(real_fd as i32).to_le_bytes());
+                        }
+                        Err(_) => {
+                            log::warn!("IMPORT_FROM_FD: bad guest_handle {}", guest_handle_val);
+                            return self.write_error_resp(resp_buf, Status::BadHandle, cookie, 0);
                         }
                     }
                 }
             }
-            // ============ END DIAGNOSTIC ============
 
             // Set pointer in outer struct to host buffer address
             let host_ptr = host_buf.as_mut_ptr() as u64;
@@ -414,21 +385,7 @@ impl NvidiaBackend {
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
             }
 
-            // ============ DIAGNOSTIC: post-ioctl for 0x3d05/0x3d06 ============
-            if escape == 0x2A && outer.len() >= 32 {
-                let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
-                if cmd == 0x3d05 || cmd == 0x3d06 {
-                    let status = u32::from_le_bytes(outer[28..32].try_into().unwrap());
-                    log::info!("    POST-IOCTL cmd=0x{:04x}: RM status=0x{:x}", cmd, status);
-                    log::info!(
-                        "    POST-IOCTL host_buf ({} bytes) = {:02x?}",
-                        host_buf.len(),
-                        &host_buf[..]
-                    );
-                }
-            }
-            // ============ END DIAGNOSTIC ============
-
+            // Log RM status
             if escape == 0x2a {
                 let status = u32::from_le_bytes(outer[28..32].try_into().unwrap());
                 let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
@@ -441,11 +398,11 @@ impl NvidiaBackend {
                     hclass,
                     status
                 );
-                if hclass == 0x90f1 {
-                    log::debug!("  VASPACE nested_in={:02x?}", nested_in);
-                    log::debug!("  VASPACE host_buf={:02x?}", &host_buf[..]);
-                    log::debug!("  VASPACE outer={:02x?}", &outer[..]);
-                }
+            }
+
+            // Restore guest_handle in host_buf before sending back to guest
+            if let Some((offset, handle_val)) = saved_nested_handle {
+                host_buf[offset..offset + 4].copy_from_slice(&handle_val.to_le_bytes());
             }
 
             // Zero pointer before sending back to guest
@@ -468,7 +425,6 @@ impl NvidiaBackend {
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
             }
 
-            let escape = (request & 0xFF) as u32;
             if escape == 0x2a {
                 let status = u32::from_le_bytes(outer[28..32].try_into().unwrap());
                 let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
