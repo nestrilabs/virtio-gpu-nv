@@ -41,6 +41,7 @@ fn device_path(kind: u8, index: u8) -> Result<CString> {
             format!("/dev/nvidia{}", index)
         }
         k if k == DeviceKind::Uvm as u8 => "/dev/nvidia-uvm".to_string(),
+        k if k == DeviceKind::Modeset as u8 => "/dev/nvidia-modeset".to_string(),
         other => return Err(DeviceError::InvalidDeviceKind(other)),
     };
     Ok(CString::new(path).unwrap())

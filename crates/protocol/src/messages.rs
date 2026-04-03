@@ -110,6 +110,8 @@ pub enum DeviceKind {
     Gpu = 1,
     /// `/dev/nvidia-uvm`
     Uvm = 2,
+    /// `/dev/nvidia-modeset`
+    Modeset = 3,
 }
 
 /// Request payload for `MsgType::Open`.
