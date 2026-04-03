@@ -275,21 +275,14 @@ impl NvidiaBackend {
             // Everything else — simple passthrough to host
             // ---------------------------------------------------------------
             _other => {
-                // Catch dedicated EXPORT/IMPORT escapes (0x5C, 0x5D) if the
-                // library uses them instead of (or in addition to) RM_CONTROL.
-                if _other == 0x5C || _other == 0x5D {
+                if _other == 0x00 {
                     log::info!(
-                        ">>> DEDICATED EXPORT/IMPORT escape=0x{:02x} param_size={} param_in={:02x?}",
-                        _other,
-                        param_in.len(),
-                        &param_in[..std::cmp::min(param_in.len(), 64)]
+                        "MODESET IOCTL: handle={} request=0x{:x} param_in={:02x?}",
+                        ireq.guest_handle,
+                        ireq.request,
+                        &param_in[..std::cmp::min(param_in.len(), 16)]
                     );
                 }
-                log::debug!(
-                    "ioctl passthrough escape=0x{:02x} size={}",
-                    _other,
-                    param_in.len()
-                );
                 self.dispatch_simple(cookie, host_fd, ireq.request, param_in, resp_buf)
             }
         }
@@ -464,6 +457,7 @@ impl NvidiaBackend {
         param_in: &[u8],
         resp_buf: &mut [u8],
     ) -> usize {
+        log::debug!("dispatch_simple: host_fd={} request=0x{:x} size={}", host_fd, request, param_in.len());
         let mut param_buf = param_in.to_vec();
         let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
         if rc < 0 {
