@@ -243,9 +243,13 @@ impl NvidiaBackend {
                 self.dispatch_fd_carrying(cookie, host_fd, ireq.request, escape, param_in, resp_buf)
             }
 
-            // ---------------------------------------------------------------
-            // Map memory — needs FD translation + SHM allocation
-            // ---------------------------------------------------------------
+            // NV_ESC_RM_ALLOC_MEMORY (0x27) — has embedded fd at offset 48
+            // NOT the same as RM_MAP_MEMORY. Simple fd translation + passthrough.
+            0x27 => {
+                self.dispatch_fd_carrying(cookie, host_fd, ireq.request, 0x27, param_in, resp_buf)
+            }
+
+            // NV_ESC_RM_MAP_MEMORY (0x4E) — the real map memory with SHM allocation
             NV_ESC_RM_MAP_MEMORY => {
                 self.dispatch_map_memory(cookie, host_fd, ireq.request, param_in, resp_buf)
             }
@@ -511,6 +515,7 @@ impl NvidiaBackend {
             NV_ESC_ALLOC_OS_EVENT => 8,
             // nv_ioctl_free_os_event_t: same layout as alloc, fd @ offset 8
             NV_ESC_FREE_OS_EVENT => 8,
+            0x27 => 48,  // NV_ESC_RM_ALLOC_MEMORY: fd at offset 48
             _ => return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOTTY),
         };
 
