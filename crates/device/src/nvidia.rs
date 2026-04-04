@@ -16,10 +16,10 @@
 //   - Add the corresponding open/ioctl paths in device_path() below.
 //   - Prefer EGLStreams over GBM in the guest compositor if possible;
 //     EGLStreams does not require /dev/nvidia-drm and avoids this dependency.
+use abi::ioctl::NV_ESC_RM_ALLOC_MEMORY;
+use protocol::messages::*;
 use std::ffi::CString;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-
-use protocol::messages::*;
 
 use crate::error::{DeviceError, Result};
 use crate::handle_table::HandleTable;
@@ -243,15 +243,20 @@ impl NvidiaBackend {
                 self.dispatch_fd_carrying(cookie, host_fd, ireq.request, escape, param_in, resp_buf)
             }
 
-            // NV_ESC_RM_ALLOC_MEMORY (0x27) — has embedded fd at offset 48
+            // NV_ESC_RM_ALLOC_MEMORY — has embedded fd at offset 48
             // NOT the same as RM_MAP_MEMORY. Simple fd translation + passthrough.
-            0x27 => {
-                self.dispatch_fd_carrying(cookie, host_fd, ireq.request, 0x27, param_in, resp_buf)
+            NV_ESC_RM_ALLOC_MEMORY => {
+                self.dispatch_fd_carrying(cookie, host_fd, ireq.request, escape, param_in, resp_buf)
             }
 
-            // NV_ESC_RM_MAP_MEMORY (0x4E) — the real map memory with SHM allocation
+            // NV_ESC_RM_MAP_MEMORY — the real map memory with SHM allocation
             NV_ESC_RM_MAP_MEMORY => {
                 self.dispatch_map_memory(cookie, host_fd, ireq.request, param_in, resp_buf)
+            }
+
+            // NV_ESC_RM_UNMAP_MEMORY
+            NV_ESC_RM_UNMAP_MEMORY => {
+                self.dispatch_unmap_memory(cookie, host_fd, ireq.request, param_in, resp_buf)
             }
 
             // ---------------------------------------------------------------
@@ -271,7 +276,7 @@ impl NvidiaBackend {
             // ---------------------------------------------------------------
             // RM alloc as well..
             // ---------------------------------------------------------------
-            NV_ESC_RM_ALLOC | NV_ESC_RM_ALLOC_MEMORY => self.dispatch_nested(
+            NV_ESC_RM_ALLOC => self.dispatch_nested(
                 cookie,
                 host_fd,
                 ireq.request,
@@ -515,7 +520,8 @@ impl NvidiaBackend {
             NV_ESC_ALLOC_OS_EVENT => 8,
             // nv_ioctl_free_os_event_t: same layout as alloc, fd @ offset 8
             NV_ESC_FREE_OS_EVENT => 8,
-            0x27 => 48,  // NV_ESC_RM_ALLOC_MEMORY: fd at offset 48
+            // NV_ESC_RM_ALLOC_MEMORY: fd at offset 48
+            NV_ESC_RM_ALLOC_MEMORY => 48,
             _ => return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOTTY),
         };
 
@@ -771,6 +777,46 @@ impl NvidiaBackend {
         off += write_struct(&mut resp_buf[off..], &iresp);
         resp_buf[off..off + param_buf.len()].copy_from_slice(&param_buf);
         off + param_buf.len()
+    }
+
+    fn dispatch_unmap_memory(
+        &mut self,
+        cookie: u64,
+        host_fd: RawFd,
+        request: u64,
+        param_in: &[u8],
+        resp_buf: &mut [u8],
+    ) -> usize {
+        // NVOS34_PARAMETERS: 32 bytes
+        // offset 16: pLinearAddress (u64) — guest has SHM-based address, host needs original
+        // For now: zero out pLinearAddress before forwarding to host.
+        // The host RM looks up by hClient/hMemory, not by address.
+
+        let mut param_buf = param_in.to_vec();
+
+        // Zero pLinearAddress — host doesn't need it for unmap lookup
+        if param_buf.len() >= 24 {
+            param_buf[16..24].copy_from_slice(&0u64.to_le_bytes());
+        }
+
+        let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
+        if rc < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            log::warn!("NV_ESC_RM_UNMAP_MEMORY: host ioctl failed: errno={}", errno);
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+        }
+
+        let status = if param_buf.len() >= 28 {
+            u32::from_le_bytes(param_buf[24..28].try_into().unwrap())
+        } else {
+            0
+        };
+        log::debug!("NV_ESC_RM_UNMAP_MEMORY: status=0x{:x}", status);
+
+        // TODO: free the SHM region that was allocated for this mapping
+        // Need to track mapping by hClient+hMemory to find the SHM offset
+
+        self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
 
     // ------------------------------------------------------------------
