@@ -589,6 +589,12 @@ impl NvidiaBackend {
     ) -> usize {
         use crate::shm::PgprotKind;
 
+        log::info!(
+            "dispatch_map_memory: ENTERED, host_fd={}, param_in.len={}",
+            host_fd,
+            param_in.len()
+        );
+
         const _NVOS33_SIZE: usize = 48;
         const WITH_FD_SIZE: usize = 56;
         const FD_OFFSET: usize = 48;
@@ -695,6 +701,14 @@ impl NvidiaBackend {
             }
         };
 
+        log::info!(
+            "dispatch_map_memory: rm_status=0x{:x}, length=0x{:x}, flags=0x{:x}, caching_type={}",
+            rm_status,
+            length,
+            flags,
+            caching_type
+        );
+
         // --- Step 5: Allocate SHM region ---
 
         let region = match self.shm.alloc(length, pgprot) {
@@ -717,6 +731,13 @@ impl NvidiaBackend {
             region.offset,
             region.length,
             region.pgprot,
+        );
+
+        log::info!(
+            "dispatch_map_memory: returning shm_offset=0x{:x} shm_length=0x{:x} pgprot={}",
+            region.offset,
+            length,
+            pgprot as u8
         );
 
         // --- Step 7: Build response with SHM metadata ---
