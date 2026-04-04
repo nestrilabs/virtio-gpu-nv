@@ -218,14 +218,21 @@ impl NvidiaBackend {
         };
 
         let escape = (ireq.request & 0xFF) as u32;
+        let ioc_type = ((ireq.request >> 8) & 0xFF) as u32;
 
-        log::trace!(
-            "IOCTL: handle={} escape=0x{:02x} req=0x{:x} param_size={}",
-            ireq.guest_handle,
-            escape,
-            ireq.request,
-            ireq.param_size
-        );
+        // nvidia-modeset ioctls: type 'm' (0x6d), nested pointer at offset 8, size at offset 4
+        if ioc_type == 0x6d {
+            return self.dispatch_nested(
+                cookie,
+                host_fd,
+                ireq.request,
+                param_in,
+                resp_buf,
+                16, // outer_size
+                8,  // ptr_offset
+                4,  // size_offset
+            );
+        }
 
         use abi::ioctl::*;
         match escape {
@@ -276,7 +283,7 @@ impl NvidiaBackend {
             // ---------------------------------------------------------------
             _other => {
                 if _other == 0x00 {
-                    log::info!(
+                    log::debug!(
                         "MODESET IOCTL: handle={} request=0x{:x} param_in={:02x?}",
                         ireq.guest_handle,
                         ireq.request,
@@ -457,7 +464,12 @@ impl NvidiaBackend {
         param_in: &[u8],
         resp_buf: &mut [u8],
     ) -> usize {
-        log::debug!("dispatch_simple: host_fd={} request=0x{:x} size={}", host_fd, request, param_in.len());
+        log::debug!(
+            "dispatch_simple: host_fd={} request=0x{:x} size={}",
+            host_fd,
+            request,
+            param_in.len()
+        );
         let mut param_buf = param_in.to_vec();
         let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
         if rc < 0 {
