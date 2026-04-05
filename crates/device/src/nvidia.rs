@@ -736,6 +736,41 @@ impl NvidiaBackend {
                 .unwrap(),
         );
 
+        {
+            let test_ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    length as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    host_map_fd,
+                    0,
+                )
+            };
+            if test_ptr != libc::MAP_FAILED {
+                let slice = unsafe {
+                    std::slice::from_raw_parts(
+                        test_ptr as *const u8,
+                        std::cmp::min(64, length as usize),
+                    )
+                };
+                log::info!(
+                    "MAP_MEMORY DIAGNOSTIC: direct mmap of host_fd={} content: {:02x?}",
+                    host_map_fd,
+                    slice
+                );
+                unsafe {
+                    libc::munmap(test_ptr, length as usize);
+                }
+            } else {
+                log::error!(
+                    "MAP_MEMORY DIAGNOSTIC: direct mmap of host_fd={} FAILED: {}",
+                    host_map_fd,
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+
         // --- Step 4: Determine pgprot from caching type ---
         //
         // The host driver may have updated the caching type in flags after
