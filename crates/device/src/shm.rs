@@ -261,6 +261,73 @@ impl ShmAllocator {
         Ok(())
     }
 
+    /// Tear down a host fd overlay from the SHM region, restoring memfd backing.
+    ///
+    /// After RM_UNMAP_MEMORY succeeds on the host, the MAP_FIXED overlay
+    /// created by map_host_fd() must be replaced. We mmap the original memfd
+    /// back over the same range so the guest sees zeroed pages rather than
+    /// stale GPU data (or worse, a dangling mapping into a closed host fd).
+    ///
+    /// This does NOT reclaim the bump-allocator cursor. The region remains
+    /// "allocated" until device teardown. A proper free-list can be added
+    /// later if SHM exhaustion becomes an issue under real workloads.
+    ///
+    /// # Safety
+    ///
+    /// `offset` and `length` must correspond to a previous map_host_fd() call
+    /// and must be page-aligned.
+    pub unsafe fn unmap_host_fd(&self, offset: u64, length: u64) -> Result<()> {
+        let target = unsafe { self.base_ptr.add(offset as usize) as *mut libc::c_void };
+
+        log::debug!(
+            "SHM unmap_host_fd: restoring memfd at offset=0x{:x} len=0x{:x}",
+            offset,
+            length
+        );
+
+        let memfd_raw = self.memfd_raw();
+        if memfd_raw >= 0 {
+            // Overlay the memfd back onto this range, replacing the host fd mapping.
+            // MAP_FIXED atomically replaces the old mapping — no window of invalid pages.
+            let ptr = unsafe {
+                libc::mmap(
+                    target,
+                    length as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_FIXED,
+                    memfd_raw,
+                    offset as libc::off_t,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                let err = std::io::Error::last_os_error();
+                log::error!(
+                    "SHM unmap_host_fd: memfd restore failed at offset=0x{:x}: {}",
+                    offset,
+                    err
+                );
+                return Err(DeviceError::Io(err));
+            }
+        } else {
+            // No memfd — this shouldn't happen in practice, but handle it
+            // by just unmapping. The guest will see a hole (SIGBUS on access).
+            log::warn!("SHM unmap_host_fd: no memfd, falling back to munmap");
+            let ret = unsafe { libc::munmap(target, length as usize) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                log::error!("SHM unmap_host_fd: munmap failed: {}", err);
+                return Err(DeviceError::Io(err));
+            }
+        }
+
+        log::info!(
+            "SHM unmap_host_fd: restored backing at offset=0x{:x} len=0x{:x}",
+            offset,
+            length
+        );
+        Ok(())
+    }
+
     pub fn memfd_raw(&self) -> RawFd {
         self.memfd.as_ref().map_or(-1, |fd| fd.as_raw_fd())
     }

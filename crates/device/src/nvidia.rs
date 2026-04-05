@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 // crates/device/src/nvidia.rs
 // Core backend: message dispatch, open/close, Phase 2 ioctl forwarding,
 // and graceful/ungraceful teardown.
@@ -16,7 +17,6 @@
 //   - Add the corresponding open/ioctl paths in device_path() below.
 //   - Prefer EGLStreams over GBM in the guest compositor if possible;
 //     EGLStreams does not require /dev/nvidia-drm and avoids this dependency.
-use abi::ioctl::NV_ESC_RM_ALLOC_MEMORY;
 use protocol::messages::*;
 use std::ffi::CString;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
@@ -51,9 +51,23 @@ fn device_path(kind: u8, index: u8) -> Result<CString> {
 // NvidiaBackend
 // ============================================================
 
+#[derive(Debug, Clone)]
+struct MapMemoryEntry {
+    host_p_linear_address: u64,
+    shm_length: u64,
+    h_client: u32,
+    h_memory: u32,
+}
+
 pub struct NvidiaBackend {
     handles: HandleTable,
     shm: ShmAllocator,
+    /// Active RM_MAP_MEMORY mappings, keyed by SHM offset.
+    ///
+    /// The SHM offset is written into pLinearAddress in the response to the
+    /// guest, so userspace echoes it back as pLinearAddress in RM_UNMAP_MEMORY.
+    /// This gives us a unique, unambiguous lookup key without leaking host VAs.
+    active_maps: HashMap<u64, MapMemoryEntry>,
 }
 impl NvidiaBackend {
     /// Create a backend with a custom SHM zone config.
@@ -61,6 +75,7 @@ impl NvidiaBackend {
         Self {
             handles: HandleTable::new(),
             shm: ShmAllocator::new(cfg),
+            active_maps: HashMap::new(),
         }
     }
 
@@ -113,9 +128,21 @@ impl NvidiaBackend {
 
     pub fn teardown(&mut self) {
         log::info!(
-            "NvidiaBackend::teardown: draining {} handles",
-            self.handles.len()
+            "NvidiaBackend::teardown: draining {} handles, {} active maps",
+            self.handles.len(),
+            self.active_maps.len()
         );
+        // Tear down SHM overlays before closing host fds
+        for (shm_offset, entry) in self.active_maps.drain() {
+            log::debug!(
+                "teardown: unmapping SHM offset={:#x} len={:#x}",
+                shm_offset,
+                entry.shm_length
+            );
+            unsafe {
+                let _ = self.shm.unmap_host_fd(shm_offset, entry.shm_length);
+            }
+        }
         self.handles.drain_all();
     }
 
@@ -751,6 +778,41 @@ impl NvidiaBackend {
             pgprot as u8
         );
 
+        // --- Step 6.5: Save host pLinearAddress and record mapping ---
+        //
+        // The host wrote its kernel VA into pLinearAddress (offset 32).
+        // We save it for later unmap, then overwrite pLinearAddress with
+        // the SHM offset. The guest library will store this and echo it
+        // back in RM_UNMAP_MEMORY, giving us a unique lookup key.
+
+        let host_p_linear = u64::from_le_bytes(param_buf[32..40].try_into().unwrap());
+        let h_client = u32::from_le_bytes(param_buf[0..4].try_into().unwrap());
+        let h_memory = u32::from_le_bytes(param_buf[8..12].try_into().unwrap());
+
+        log::info!(
+            "MAP_MEMORY: saving (shm_off={:#x}) → host_va={:#x} client={:#x} mem={:#x}",
+            region.offset,
+            host_p_linear,
+            h_client,
+            h_memory
+        );
+
+        self.active_maps.insert(
+            region.offset,
+            MapMemoryEntry {
+                host_p_linear_address: host_p_linear,
+                shm_length: length,
+                h_client,
+                h_memory,
+            },
+        );
+
+        // Replace host VA with SHM offset in pLinearAddress — this is what
+        // the guest sees. It's not a real pointer; the guest driver uses the
+        // SHM metadata (shm_offset/shm_length/pgprot in IoctlResp) for mmap,
+        // and the library stores this value to pass back at unmap time.
+        param_buf[32..40].copy_from_slice(&region.offset.to_le_bytes());
+
         // --- Step 7: Build response with SHM metadata ---
 
         let hdr = RespHeader {
@@ -787,35 +849,90 @@ impl NvidiaBackend {
         param_in: &[u8],
         resp_buf: &mut [u8],
     ) -> usize {
-        // NVOS34_PARAMETERS: 32 bytes
-        // offset 16: pLinearAddress (u64) — guest has SHM-based address, host needs original
-        // For now: zero out pLinearAddress before forwarding to host.
-        // The host RM looks up by hClient/hMemory, not by address.
+        // NVOS34_PARAMETERS layout (32 bytes):
+        //   offset  0: hClient          u32
+        //   offset  4: hDevice          u32
+        //   offset  8: hMemory          u32
+        //   offset 12: pad              u32
+        //   offset 16: pLinearAddress   u64  ← guest sends SHM offset (we wrote it during map)
+        //   offset 24: status           u32
+        //   offset 28: flags            u32
 
-        let mut param_buf = param_in.to_vec();
-
-        // Zero pLinearAddress — host doesn't need it for unmap lookup
-        if param_buf.len() >= 24 {
-            param_buf[16..24].copy_from_slice(&0u64.to_le_bytes());
+        if param_in.len() < 32 {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
         }
+
+        let h_client = u32::from_le_bytes(param_in[0..4].try_into().unwrap());
+        let h_memory = u32::from_le_bytes(param_in[8..12].try_into().unwrap());
+        let guest_linear = u64::from_le_bytes(param_in[16..24].try_into().unwrap());
+
+        // guest_linear is the SHM offset we wrote into pLinearAddress during map.
+        // Use it as the lookup key.
+        let entry = match self.active_maps.remove(&guest_linear) {
+            Some(e) => e,
+            None => {
+                log::warn!(
+                    "UNMAP_MEMORY: no mapping for pLinearAddress={:#x} \
+                     (hClient={:#x}, hMemory={:#x})",
+                    guest_linear,
+                    h_client,
+                    h_memory
+                );
+                // Forward with the guest value — host will reject but we
+                // report the error cleanly rather than crashing
+                let mut param_buf = param_in.to_vec();
+                let rc =
+                    unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
+                if rc < 0 {
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+                }
+                return self.write_ioctl_resp(resp_buf, cookie, &param_buf);
+            }
+        };
+
+        log::info!(
+            "UNMAP_MEMORY: shm_off={:#x} → host_va={:#x} (client={:#x}, mem={:#x})",
+            guest_linear,
+            entry.host_p_linear_address,
+            h_client,
+            h_memory
+        );
+
+        // Substitute the real host pLinearAddress for the host ioctl
+        let mut param_buf = param_in.to_vec();
+        param_buf[16..24].copy_from_slice(&entry.host_p_linear_address.to_le_bytes());
 
         let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            log::warn!("NV_ESC_RM_UNMAP_MEMORY: host ioctl failed: errno={}", errno);
+            log::warn!("UNMAP_MEMORY: host ioctl failed: errno={}", errno);
+            // Restore the entry since unmap didn't happen
+            self.active_maps.insert(guest_linear, entry);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         }
 
-        let status = if param_buf.len() >= 28 {
-            u32::from_le_bytes(param_buf[24..28].try_into().unwrap())
+        let status = u32::from_le_bytes(param_buf[24..28].try_into().unwrap());
+        log::info!("UNMAP_MEMORY: host status=0x{:x}", status);
+
+        if status == 0 {
+            // Host unmap succeeded — tear down the SHM overlay
+            unsafe {
+                if let Err(e) = self.shm.unmap_host_fd(guest_linear, entry.shm_length) {
+                    log::warn!("UNMAP_MEMORY: SHM unmap_host_fd failed: {} (non-fatal)", e);
+                }
+            }
         } else {
-            0
-        };
-        log::debug!("NV_ESC_RM_UNMAP_MEMORY: status=0x{:x}", status);
+            // Host returned RM error — put the entry back
+            log::warn!(
+                "UNMAP_MEMORY: host RM status 0x{:x}, restoring mapping",
+                status
+            );
+            self.active_maps.insert(guest_linear, entry);
+        }
 
-        // TODO: free the SHM region that was allocated for this mapping
-        // Need to track mapping by hClient+hMemory to find the SHM offset
-
+        // Zero pLinearAddress in response — guest doesn't need it
+        param_buf[16..24].copy_from_slice(&0u64.to_le_bytes());
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
 
