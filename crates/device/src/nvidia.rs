@@ -441,6 +441,24 @@ impl NvidiaBackend {
                     hclass,
                     status
                 );
+                // Log full nested params for channel-related allocs
+                if hclass == 0xa06c
+                    || hclass == 0x9067
+                    || hclass == 0x90f1
+                    || hclass == 0xc36f
+                    || hclass == 0xc46f
+                    || hclass == 0xb06f
+                    || hclass == 0xc06f
+                    || hclass == 0xc56f
+                    || (hclass >= 0xb000 && hclass <= 0xcfff)
+                {
+                    log::info!(
+                        "RM_ALLOC hClass=0x{:04x} nested_response[{}]={:02x?}",
+                        hclass,
+                        host_buf.len(),
+                        &host_buf[..std::cmp::min(host_buf.len(), 64)]
+                    );
+                }
             }
 
             // Restore guest_handle in host_buf before sending back to guest
@@ -514,13 +532,12 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         } else {
             let escape = (request & 0xFF) as u32;
-            if escape == 0xd4 || escape == 0x4a {
-                log::info!(
-                    "dispatch_simple: escape=0x{:02x} succeeded, response={:02x?}",
-                    escape,
-                    &param_buf[..std::cmp::min(param_buf.len(), 64)]
-                );
-            }
+            log::debug!(
+                "dispatch_simple: escape=0x{:02x} succeeded, size={}, response={:02x?}",
+                escape,
+                param_buf.len(),
+                &param_buf[..std::cmp::min(param_buf.len(), 32)]
+            );
         }
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
