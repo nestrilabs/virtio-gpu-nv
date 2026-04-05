@@ -781,6 +781,21 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
         }
 
+        {
+            let dump_len = std::cmp::min(64, length as usize);
+            let base = self.shm.base_ptr();
+            if !base.is_null() {
+                let slice = unsafe {
+                    std::slice::from_raw_parts(base.add(region.offset as usize), dump_len)
+                };
+                log::info!(
+                    "MAP_MEMORY: SHM content after map (first {} bytes): {:02x?}",
+                    dump_len,
+                    slice
+                );
+            }
+        }
+
         log::info!(
             "NV_ESC_RM_MAP_MEMORY: allocated SHM region offset=0x{:x} length=0x{:x} pgprot={:?}",
             region.offset,
