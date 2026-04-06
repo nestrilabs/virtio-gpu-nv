@@ -251,6 +251,9 @@ impl ShmAllocator {
             );
             return Err(DeviceError::Io(err));
         }
+        let mut sample = [0u8; 16];
+        unsafe { std::ptr::copy_nonoverlapping(ptr as *const u8, sample.as_mut_ptr(), 16) };
+        log::info!("SHM map_host_fd: post-overlay read: {:02x?}", sample);
         log::info!(
             "SHM map_host_fd: mapped fd={} at offset=0x{:x} length=0x{:x} result={:?}",
             host_fd,
