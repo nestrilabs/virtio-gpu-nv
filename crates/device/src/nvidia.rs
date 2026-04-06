@@ -322,6 +322,9 @@ impl NvidiaBackend {
             // Everything else — simple passthrough to host
             // ---------------------------------------------------------------
             _other => {
+                if _other == 0x5E {
+                    log::warn!("0x5E hit DEFAULT arm instead of dedicated handler!");
+                }
                 if _other == 0x00 {
                     log::debug!(
                         "MODESET IOCTL: handle={} request=0x{:x} param_in={:02x?}",
@@ -624,6 +627,12 @@ impl NvidiaBackend {
         //   offset 24: pNewCpuAddress   u64  (NvP64)
         //   offset 32: status           u32
         //   offset 36: pad              u32
+
+        log::info!(
+            "UPDATE_DEVICE_MAPPING_INFO: ENTERED, host_fd={}, param_in.len={}",
+            host_fd,
+            param_in.len()
+        );
 
         if param_in.len() < 40 {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
