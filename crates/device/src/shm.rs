@@ -170,11 +170,6 @@ impl ShmAllocator {
     }
 
     /// Override the base pointer used for MAP_FIXED operations.
-    ///
-    /// Called by the VMM after guest memory is set up, passing the HVA
-    /// of the guest physical address range allocated for the SHM BAR.
-    /// After this call, map_host_fd() will mmap directly into guest
-    /// memory (visible via EPT/NPT), not into the memfd.
     pub fn set_base_ptr(&mut self, ptr: *mut u8) {
         log::info!(
             "ShmAllocator: base_ptr updated from {:?} to {:?}",
@@ -210,24 +205,8 @@ impl ShmAllocator {
     }
 
     /// mmap a host fd into the SHM region at the given offset.
-    pub fn map_host_fd(
-        &self,
-        shm_offset: u64,
-        length: u64,
-        host_fd: RawFd,
-        host_mmap_offset: u64,
-    ) -> Result<()> {
+    pub fn map_host_fd(&self, shm_offset: u64, length: u64, host_fd: RawFd) -> Result<()> {
         let target = unsafe { self.base_ptr.add(shm_offset as usize) as *mut libc::c_void };
-
-        log::info!(
-            "SHM map_host_fd: base_ptr={:?} shm_offset=0x{:x} target={:?} len=0x{:x} fd={} host_off=0x{:x}",
-            self.base_ptr,
-            shm_offset,
-            target,
-            length,
-            host_fd,
-            host_mmap_offset
-        );
 
         let ptr = unsafe {
             libc::mmap(
@@ -236,50 +215,24 @@ impl ShmAllocator {
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED | libc::MAP_FIXED,
                 host_fd,
-                host_mmap_offset as libc::off_t,
+                0, // nvidia mmap handler uses context list, not offset
             )
         };
         if ptr == libc::MAP_FAILED {
             let err = std::io::Error::last_os_error();
             log::error!(
-                "SHM map_host_fd: mmap(shm_offset=0x{:x}, len=0x{:x}, fd={}, host_off=0x{:x}) failed: {}",
+                "SHM map_host_fd: mmap(shm_offset=0x{:x}, len=0x{:x}, fd={}, failed: {}",
                 shm_offset,
                 length,
                 host_fd,
-                host_mmap_offset,
                 err
             );
             return Err(DeviceError::Io(err));
         }
-        let mut sample = [0u8; 16];
-        unsafe { std::ptr::copy_nonoverlapping(ptr as *const u8, sample.as_mut_ptr(), 16) };
-        log::info!("SHM map_host_fd: post-overlay read: {:02x?}", sample);
-        log::info!(
-            "SHM map_host_fd: mapped fd={} at shm_offset=0x{:x} length=0x{:x} host_off=0x{:x} result={:?}",
-            host_fd,
-            shm_offset,
-            length,
-            host_mmap_offset,
-            ptr
-        );
         Ok(())
     }
 
     /// Tear down a host fd overlay from the SHM region, restoring memfd backing.
-    ///
-    /// After RM_UNMAP_MEMORY succeeds on the host, the MAP_FIXED overlay
-    /// created by map_host_fd() must be replaced. We mmap the original memfd
-    /// back over the same range so the guest sees zeroed pages rather than
-    /// stale GPU data (or worse, a dangling mapping into a closed host fd).
-    ///
-    /// This does NOT reclaim the bump-allocator cursor. The region remains
-    /// "allocated" until device teardown. A proper free-list can be added
-    /// later if SHM exhaustion becomes an issue under real workloads.
-    ///
-    /// # Safety
-    ///
-    /// `offset` and `length` must correspond to a previous map_host_fd() call
-    /// and must be page-aligned.
     pub unsafe fn unmap_host_fd(&self, offset: u64, length: u64) -> Result<()> {
         let target = unsafe { self.base_ptr.add(offset as usize) as *mut libc::c_void };
 
@@ -467,9 +420,7 @@ mod tests {
             libc::munmap(tmp, 4096);
         }
 
-        unsafe {
-            a.map_host_fd(region.offset, 4096, host_fd, 0).unwrap();
-        }
+        a.map_host_fd(region.offset, 4096, host_fd).unwrap();
 
         unsafe {
             let val = *a.base_ptr().add(region.offset as usize);

@@ -1,22 +1,5 @@
 use std::collections::HashMap;
 // crates/device/src/nvidia.rs
-// Core backend: message dispatch, open/close, Phase 2 ioctl forwarding,
-// and graceful/ungraceful teardown.
-//
-// --- Phase 5 note: /dev/nvidia-drm and /dev/nvidia-modeset ---
-//
-// Phases 1-4 only require /dev/nvidiactl, /dev/nvidia#, and /dev/nvidia-uvm.
-// This holds for headless compute/encode (CUDA, NVENC, Vulkan headless).
-//
-// Phase 5 (compositor integration) may require /dev/nvidia-drm IF the guest
-// compositor uses GBM (gbm_create_device) for buffer allocation, or wants
-// DRM/KMS for display timing.  Both GBM and the DRM master path call into
-// /dev/nvidia-drm.  If this becomes necessary:
-//   - Add NV_DEV_DRM and NV_DEV_MODESET variants to DeviceKind in
-//     protocol/src/messages.rs.
-//   - Add the corresponding open/ioctl paths in device_path() below.
-//   - Prefer EGLStreams over GBM in the guest compositor if possible;
-//     EGLStreams does not require /dev/nvidia-drm and avoids this dependency.
 use protocol::messages::*;
 use std::ffi::CString;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
@@ -618,16 +601,6 @@ impl NvidiaBackend {
         param_in: &[u8],
         resp_buf: &mut [u8],
     ) -> usize {
-        // NVOS56_PARAMETERS layout (40 bytes on 64-bit):
-        //   offset  0: hClient          u32
-        //   offset  4: hDevice          u32
-        //   offset  8: hMemory          u32
-        //   offset 12: pad              u32  (alignment)
-        //   offset 16: pOldCpuAddress   u64  (NvP64)
-        //   offset 24: pNewCpuAddress   u64  (NvP64)
-        //   offset 32: status           u32
-        //   offset 36: pad              u32
-
         log::info!(
             "UPDATE_DEVICE_MAPPING_INFO: ENTERED, host_fd={}, param_in.len={}",
             host_fd,
@@ -693,35 +666,6 @@ impl NvidiaBackend {
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
 
-    // ------------------------------------------------------------------
-    // NV_ESC_RM_MAP_MEMORY handler
-    //
-    // Wire layout of param_in (IoctlNVOS33ParametersWithFD):
-    //
-    //   offset  0: NVOS33_PARAMETERS (48 bytes)
-    //     offset  0: hClient       u32
-    //     offset  4: hDevice       u32
-    //     offset  8: hMemory       u32
-    //     offset 12: pad           [4]u8
-    //     offset 16: offset        u64
-    //     offset 24: length        u64
-    //     offset 32: pLinearAddress u64
-    //     offset 40: status        u32
-    //     offset 44: flags         u32
-    //   offset 48: fd              i32   (guest handle → host fd)
-    //   offset 52: pad             [4]u8
-    //
-    // Total: 56 bytes.
-    //
-    // Flow (ported from gVisor nvproxy frontend.go:rmMapMemory):
-    //   1. Translate the embedded FD (guest handle → host fd).
-    //   2. Call the host ioctl.
-    //   3. If successful, read the updated flags to determine caching type.
-    //   4. Allocate a region from the SHM BAR (correct zone per pgprot).
-    //   5. mmap the host fd into the SHM region.
-    //   6. Return the SHM offset, length, and pgprot to the guest.
-    //   7. Restore the guest handle in the response params.
-    // ------------------------------------------------------------------
     fn dispatch_map_memory(
         &mut self,
         cookie: u64,
@@ -731,12 +675,6 @@ impl NvidiaBackend {
         resp_buf: &mut [u8],
     ) -> usize {
         use crate::shm::PgprotKind;
-
-        log::info!(
-            "dispatch_map_memory: ENTERED, host_fd={}, param_in.len={}",
-            host_fd,
-            param_in.len()
-        );
 
         const _NVOS33_SIZE: usize = 48;
         const WITH_FD_SIZE: usize = 56;
@@ -844,14 +782,6 @@ impl NvidiaBackend {
             }
         };
 
-        log::info!(
-            "dispatch_map_memory: rm_status=0x{:x}, length=0x{:x}, flags=0x{:x}, caching_type={}",
-            rm_status,
-            length,
-            flags,
-            caching_type
-        );
-
         // --- Step 5: Allocate SHM region ---
 
         let region = match self.shm.alloc(length, pgprot) {
@@ -862,21 +792,11 @@ impl NvidiaBackend {
             }
         };
 
-        // --- Step 6: Read host pLinearAddress BEFORE mmap ---
-        let host_p_linear = u64::from_le_bytes(param_buf[32..40].try_into().unwrap());
-
-        // --- Step 6a: mmap the host fd into the SHM region using host's pLinearAddress as offset ---
-        if let Err(e) = self.shm.map_host_fd(region.offset, length, host_map_fd, host_p_linear) {
+        // --- Step 6: mmap the host fd into the SHM region ---
+        if let Err(e) = self.shm.map_host_fd(region.offset, length, host_map_fd) {
             log::error!("NV_ESC_RM_MAP_MEMORY: map_host_fd failed: {}", e);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
         }
-
-        log::info!(
-            "NV_ESC_RM_MAP_MEMORY: allocated SHM region offset=0x{:x} length=0x{:x} pgprot={:?}",
-            region.offset,
-            region.length,
-            region.pgprot,
-        );
 
         log::info!(
             "dispatch_map_memory: returning shm_offset=0x{:x} shm_length=0x{:x} pgprot={}",
@@ -956,15 +876,6 @@ impl NvidiaBackend {
         param_in: &[u8],
         resp_buf: &mut [u8],
     ) -> usize {
-        // NVOS34_PARAMETERS layout (32 bytes):
-        //   offset  0: hClient          u32
-        //   offset  4: hDevice          u32
-        //   offset  8: hMemory          u32
-        //   offset 12: pad              u32
-        //   offset 16: pLinearAddress   u64  ← guest sends SHM offset (we wrote it during map)
-        //   offset 24: status           u32
-        //   offset 28: flags            u32
-
         if param_in.len() < 32 {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
         }
