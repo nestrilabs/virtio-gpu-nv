@@ -218,7 +218,7 @@ impl ShmAllocator {
     ///
     /// `host_fd` must be a valid fd that supports mmap.
     /// `offset` and `length` must be within the BAR and page-aligned.
-    pub unsafe fn map_host_fd(&self, offset: u64, length: u64, host_fd: RawFd) -> Result<()> {
+    pub fn map_host_fd(&self, offset: u64, length: u64, host_fd: RawFd) -> Result<()> {
         let target = unsafe { self.base_ptr.add(offset as usize) as *mut libc::c_void };
 
         log::info!(

@@ -864,7 +864,7 @@ impl NvidiaBackend {
 
         // --- Step 6: mmap the host fd into the SHM region ---
 
-        if let Err(e) = unsafe { self.shm.map_host_fd(region.offset, length, host_map_fd) } {
+        if let Err(e) = self.shm.map_host_fd(region.offset, length, host_map_fd) {
             log::error!("NV_ESC_RM_MAP_MEMORY: map_host_fd failed: {}", e);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
         }
