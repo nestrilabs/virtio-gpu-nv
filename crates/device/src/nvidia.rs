@@ -834,11 +834,8 @@ impl NvidiaBackend {
             },
         );
 
-        // Replace host VA with SHM offset in pLinearAddress — this is what
-        // the guest sees. It's not a real pointer; the guest driver uses the
-        // SHM metadata (shm_offset/shm_length/pgprot in IoctlResp) for mmap,
-        // and the library stores this value to pass back at unmap time.
-        param_buf[32..40].copy_from_slice(&region.offset.to_le_bytes());
+        // Just write zero to test..
+        param_buf[32..40].copy_from_slice(&0u64.to_le_bytes());
 
         // --- Step 7: Build response with SHM metadata ---
 
