@@ -247,13 +247,6 @@ impl NvidiaBackend {
         let escape = (ireq.request & 0xFF) as u32;
         let ioc_type = ((ireq.request >> 8) & 0xFF) as u32;
 
-        log::info!(
-            "IOCTL escape=0x{:02x} handle={} param_size={}",
-            escape,
-            ireq.guest_handle,
-            ireq.param_size
-        );
-
         // nvidia-modeset ioctls: type 'm' (0x6d), nested pointer at offset 8, size at offset 4
         if ioc_type == 0x6d {
             return self.dispatch_nested(
