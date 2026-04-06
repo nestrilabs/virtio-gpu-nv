@@ -433,36 +433,25 @@ impl NvidiaBackend {
             }
 
             // Log RM status
-            if escape == 0x2a {
-                let status = u32::from_le_bytes(outer[28..32].try_into().unwrap());
-                let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
-                log::debug!("(if) RM_CONTROL cmd=0x{:08x} status=0x{:x}", cmd, status);
-            } else if escape == 0x2b {
-                let status = u32::from_le_bytes(outer[40..44].try_into().unwrap());
-                let hclass = u32::from_le_bytes(outer[12..16].try_into().unwrap());
-                log::debug!(
-                    "(if) RM_ALLOC hClass=0x{:04x} status=0x{:x}",
-                    hclass,
-                    status
+            if escape == 0x2a && param_in.len() >= 32 {
+                let cmd = u32::from_le_bytes(param_in[8..12].try_into().unwrap());
+                let params_size = u32::from_le_bytes(param_in[24..28].try_into().unwrap());
+                log::info!(
+                    "RM_CONTROL ENTER: cmd=0x{:08x} paramsSize={} (nested_bytes={})",
+                    cmd,
+                    params_size,
+                    param_in.len() - 32
                 );
-                // Log full nested params for channel-related allocs
-                if hclass == 0xa06c
-                    || hclass == 0x9067
-                    || hclass == 0x90f1
-                    || hclass == 0xc36f
-                    || hclass == 0xc46f
-                    || hclass == 0xb06f
-                    || hclass == 0xc06f
-                    || hclass == 0xc56f
-                    || (hclass >= 0xb000 && hclass <= 0xcfff)
-                {
-                    log::info!(
-                        "RM_ALLOC hClass=0x{:04x} nested_response[{}]={:02x?}",
-                        hclass,
-                        host_buf.len(),
-                        &host_buf[..std::cmp::min(host_buf.len(), 64)]
-                    );
-                }
+            }
+            if escape == 0x2b && param_in.len() >= 48 {
+                let hclass = u32::from_le_bytes(param_in[12..16].try_into().unwrap());
+                let params_size = u32::from_le_bytes(param_in[32..36].try_into().unwrap());
+                log::info!(
+                    "RM_ALLOC ENTER: hClass=0x{:04x} paramsSize={} (nested_bytes={})",
+                    hclass,
+                    params_size,
+                    param_in.len() - 48
+                );
             }
 
             // Restore guest_handle in host_buf before sending back to guest
