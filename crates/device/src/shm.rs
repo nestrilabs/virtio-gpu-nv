@@ -210,24 +210,23 @@ impl ShmAllocator {
     }
 
     /// mmap a host fd into the SHM region at the given offset.
-    ///
-    /// Uses MAP_FIXED to overlay the host GPU mapping onto the base
-    /// pointer region (either guest memory HVA or memfd fallback).
-    ///
-    /// # Safety
-    ///
-    /// `host_fd` must be a valid fd that supports mmap.
-    /// `offset` and `length` must be within the BAR and page-aligned.
-    pub fn map_host_fd(&self, offset: u64, length: u64, host_fd: RawFd) -> Result<()> {
-        let target = unsafe { self.base_ptr.add(offset as usize) as *mut libc::c_void };
+    pub fn map_host_fd(
+        &self,
+        shm_offset: u64,
+        length: u64,
+        host_fd: RawFd,
+        host_mmap_offset: u64,
+    ) -> Result<()> {
+        let target = unsafe { self.base_ptr.add(shm_offset as usize) as *mut libc::c_void };
 
         log::info!(
-            "SHM map_host_fd: base_ptr={:?} offset=0x{:x} target={:?} len=0x{:x} fd={}",
+            "SHM map_host_fd: base_ptr={:?} shm_offset=0x{:x} target={:?} len=0x{:x} fd={} host_off=0x{:x}",
             self.base_ptr,
-            offset,
+            shm_offset,
             target,
             length,
-            host_fd
+            host_fd,
+            host_mmap_offset
         );
 
         let ptr = unsafe {
@@ -237,16 +236,17 @@ impl ShmAllocator {
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED | libc::MAP_FIXED,
                 host_fd,
-                0,
+                host_mmap_offset as libc::off_t,
             )
         };
         if ptr == libc::MAP_FAILED {
             let err = std::io::Error::last_os_error();
             log::error!(
-                "SHM map_host_fd: mmap(offset=0x{:x}, len=0x{:x}, fd={}) failed: {}",
-                offset,
+                "SHM map_host_fd: mmap(shm_offset=0x{:x}, len=0x{:x}, fd={}, host_off=0x{:x}) failed: {}",
+                shm_offset,
                 length,
                 host_fd,
+                host_mmap_offset,
                 err
             );
             return Err(DeviceError::Io(err));
@@ -255,10 +255,11 @@ impl ShmAllocator {
         unsafe { std::ptr::copy_nonoverlapping(ptr as *const u8, sample.as_mut_ptr(), 16) };
         log::info!("SHM map_host_fd: post-overlay read: {:02x?}", sample);
         log::info!(
-            "SHM map_host_fd: mapped fd={} at offset=0x{:x} length=0x{:x} result={:?}",
+            "SHM map_host_fd: mapped fd={} at shm_offset=0x{:x} length=0x{:x} host_off=0x{:x} result={:?}",
             host_fd,
-            offset,
+            shm_offset,
             length,
+            host_mmap_offset,
             ptr
         );
         Ok(())
@@ -467,7 +468,7 @@ mod tests {
         }
 
         unsafe {
-            a.map_host_fd(region.offset, 4096, host_fd).unwrap();
+            a.map_host_fd(region.offset, 4096, host_fd, 0).unwrap();
         }
 
         unsafe {

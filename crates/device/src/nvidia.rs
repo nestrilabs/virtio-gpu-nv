@@ -862,9 +862,11 @@ impl NvidiaBackend {
             }
         };
 
-        // --- Step 6: mmap the host fd into the SHM region ---
+        // --- Step 6: Read host pLinearAddress BEFORE mmap ---
+        let host_p_linear = u64::from_le_bytes(param_buf[32..40].try_into().unwrap());
 
-        if let Err(e) = self.shm.map_host_fd(region.offset, length, host_map_fd) {
+        // --- Step 6a: mmap the host fd into the SHM region using host's pLinearAddress as offset ---
+        if let Err(e) = self.shm.map_host_fd(region.offset, length, host_map_fd, host_p_linear) {
             log::error!("NV_ESC_RM_MAP_MEMORY: map_host_fd failed: {}", e);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
         }
