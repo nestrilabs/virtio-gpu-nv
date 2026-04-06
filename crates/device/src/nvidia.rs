@@ -247,7 +247,12 @@ impl NvidiaBackend {
         let escape = (ireq.request & 0xFF) as u32;
         let ioc_type = ((ireq.request >> 8) & 0xFF) as u32;
 
-        log::info!("IOCTL escape=0x{:02x} handle={} param_size={}", escape, ireq.guest_handle, ireq.param_size);
+        log::info!(
+            "IOCTL escape=0x{:02x} handle={} param_size={}",
+            escape,
+            ireq.guest_handle,
+            ireq.param_size
+        );
 
         // nvidia-modeset ioctls: type 'm' (0x6d), nested pointer at offset 8, size at offset 4
         if ioc_type == 0x6d {
@@ -534,12 +539,21 @@ impl NvidiaBackend {
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         } else {
             let escape = (request & 0xFF) as u32;
-            log::debug!(
-                "dispatch_simple: escape=0x{:02x} succeeded, size={}, response={:02x?}",
-                escape,
-                param_buf.len(),
-                &param_buf[..std::cmp::min(param_buf.len(), 32)]
-            );
+            if escape == 0x57 || escape == 0x58 {
+                log::info!(
+                    "MAP/UNMAP_DMA(0x{:02x}): response[{}]={:02x?}",
+                    escape,
+                    param_buf.len(),
+                    &param_buf[..std::cmp::min(param_buf.len(), 64)]
+                );
+            }
+            if escape == 0x4a {
+                log::info!(
+                    "VID_HEAP_CONTROL: response[{}]={:02x?}",
+                    param_buf.len(),
+                    &param_buf[..std::cmp::min(param_buf.len(), 184)]
+                );
+            }
         }
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
