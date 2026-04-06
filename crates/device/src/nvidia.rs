@@ -277,21 +277,25 @@ impl NvidiaBackend {
                 self.dispatch_fd_carrying(cookie, host_fd, ireq.request, escape, param_in, resp_buf)
             }
 
-            // NV_ESC_RM_ALLOC_MEMORY — has embedded fd at offset 48
-            // NOT the same as RM_MAP_MEMORY. Simple fd translation + passthrough.
             NV_ESC_RM_ALLOC_MEMORY => {
                 self.dispatch_fd_carrying(cookie, host_fd, ireq.request, escape, param_in, resp_buf)
             }
 
-            // NV_ESC_RM_MAP_MEMORY — the real map memory with SHM allocation
             NV_ESC_RM_MAP_MEMORY => {
                 self.dispatch_map_memory(cookie, host_fd, ireq.request, param_in, resp_buf)
             }
 
-            // NV_ESC_RM_UNMAP_MEMORY
             NV_ESC_RM_UNMAP_MEMORY => {
                 self.dispatch_unmap_memory(cookie, host_fd, ireq.request, param_in, resp_buf)
             }
+
+            NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO => self.dispatch_update_device_mapping_info(
+                cookie,
+                host_fd,
+                ireq.request,
+                param_in,
+                resp_buf,
+            ),
 
             // ---------------------------------------------------------------
             // RM control requires nested handling
@@ -621,6 +625,83 @@ impl NvidiaBackend {
         self.write_ioctl_resp(resp_buf, cookie, &param_buf)
     }
 
+    fn dispatch_update_device_mapping_info(
+        &self,
+        cookie: u64,
+        host_fd: RawFd,
+        request: u64,
+        param_in: &[u8],
+        resp_buf: &mut [u8],
+    ) -> usize {
+        // NVOS56_PARAMETERS layout (40 bytes on 64-bit):
+        //   offset  0: hClient          u32
+        //   offset  4: hDevice          u32
+        //   offset  8: hMemory          u32
+        //   offset 12: pad              u32  (alignment)
+        //   offset 16: pOldCpuAddress   u64  (NvP64)
+        //   offset 24: pNewCpuAddress   u64  (NvP64)
+        //   offset 32: status           u32
+        //   offset 36: pad              u32
+
+        if param_in.len() < 40 {
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::EINVAL);
+        }
+
+        let h_client = u32::from_le_bytes(param_in[0..4].try_into().unwrap());
+        let h_memory = u32::from_le_bytes(param_in[8..12].try_into().unwrap());
+        let old_cpu_addr = u64::from_le_bytes(param_in[16..24].try_into().unwrap());
+        let new_cpu_addr = u64::from_le_bytes(param_in[24..32].try_into().unwrap());
+
+        log::info!(
+            "UPDATE_DEVICE_MAPPING_INFO: client={:#x} mem={:#x} old={:#x} new={:#x}",
+            h_client,
+            h_memory,
+            old_cpu_addr,
+            new_cpu_addr
+        );
+
+        // The guest sends SHM offsets or guest VAs. The host RM needs host VAs.
+        // Look up the mapping by scanning active_maps for matching hMemory,
+        // since the guest's "old" address won't match any host address.
+        let mut host_old = old_cpu_addr;
+        for (_shm_off, entry) in &self.active_maps {
+            if entry.h_client == h_client && entry.h_memory == h_memory {
+                host_old = entry.host_p_linear_address;
+                log::info!(
+                    "UPDATE_DEVICE_MAPPING_INFO: translated old {:#x} → host {:#x}",
+                    old_cpu_addr,
+                    host_old
+                );
+                break;
+            }
+        }
+
+        let mut param_buf = param_in.to_vec();
+        // Set pOldCpuAddress to host VA
+        param_buf[16..24].copy_from_slice(&host_old.to_le_bytes());
+        // Set pNewCpuAddress to host VA too (the host mapping didn't move)
+        param_buf[24..32].copy_from_slice(&host_old.to_le_bytes());
+
+        let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
+        if rc < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            log::warn!(
+                "UPDATE_DEVICE_MAPPING_INFO: host ioctl failed: errno={}",
+                errno
+            );
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+        }
+
+        let status = u32::from_le_bytes(param_buf[32..36].try_into().unwrap());
+        log::info!("UPDATE_DEVICE_MAPPING_INFO: host status=0x{:x}", status);
+
+        // Zero out the addresses before sending back to guest
+        param_buf[16..24].copy_from_slice(&0u64.to_le_bytes());
+        param_buf[24..32].copy_from_slice(&0u64.to_le_bytes());
+
+        self.write_ioctl_resp(resp_buf, cookie, &param_buf)
+    }
+
     // ------------------------------------------------------------------
     // NV_ESC_RM_MAP_MEMORY handler
     //
@@ -752,41 +833,6 @@ impl NvidiaBackend {
                 .unwrap(),
         );
 
-        {
-            let test_ptr = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    length as usize,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    host_map_fd,
-                    0,
-                )
-            };
-            if test_ptr != libc::MAP_FAILED {
-                let slice = unsafe {
-                    std::slice::from_raw_parts(
-                        test_ptr as *const u8,
-                        std::cmp::min(64, length as usize),
-                    )
-                };
-                log::info!(
-                    "MAP_MEMORY DIAGNOSTIC: direct mmap of host_fd={} content: {:02x?}",
-                    host_map_fd,
-                    slice
-                );
-                unsafe {
-                    libc::munmap(test_ptr, length as usize);
-                }
-            } else {
-                log::error!(
-                    "MAP_MEMORY DIAGNOSTIC: direct mmap of host_fd={} FAILED: {}",
-                    host_map_fd,
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
-
         // --- Step 4: Determine pgprot from caching type ---
         //
         // The host driver may have updated the caching type in flags after
@@ -830,21 +876,6 @@ impl NvidiaBackend {
         if let Err(e) = unsafe { self.shm.map_host_fd(region.offset, length, host_map_fd) } {
             log::error!("NV_ESC_RM_MAP_MEMORY: map_host_fd failed: {}", e);
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, libc::ENOMEM);
-        }
-
-        {
-            let dump_len = std::cmp::min(64, length as usize);
-            let base = self.shm.base_ptr();
-            if !base.is_null() {
-                let slice = unsafe {
-                    std::slice::from_raw_parts(base.add(region.offset as usize), dump_len)
-                };
-                log::info!(
-                    "MAP_MEMORY: SHM content after map (first {} bytes): {:02x?}",
-                    dump_len,
-                    slice
-                );
-            }
         }
 
         log::info!(
