@@ -590,33 +590,13 @@ impl NvidiaBackend {
         let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-
-            // Handle EBUSY (errno=16) - device busy
-            // For some ioctls, this is a soft failure - return success with status
-            if errno == libc::EBUSY
-                && (
-                    escape == 0xd6 || // SYS_PARAMS
-                escape == 0xd7 || // QUERY_DEVICE_INTR
-                escape == 0xc8
-                    // CARD_INFO
-                )
-            {
-                log::warn!(
-                    "ioctl(0x{:x}/0x{:02x}) returned EBUSY - synthesizing success",
-                    request,
-                    escape
-                );
-                // Return what we sent - caller will check status field
-                return self.write_ioctl_resp(resp_buf, cookie, &param_buf);
-            } else {
-                log::warn!(
-                    "ioctl(0x{:x}/0x{:02x}) failed: errno={}",
-                    request,
-                    escape,
-                    errno
-                );
-                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
-            }
+            log::warn!(
+                "ioctl(0x{:x}/0x{:02x}) failed: errno={}",
+                request,
+                escape,
+                errno
+            );
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         } else {
             if log_response {
                 let preview = &param_buf[..std::cmp::min(param_buf.len(), 128)];
@@ -634,16 +614,38 @@ impl NvidiaBackend {
                     }
                     0x2a => {
                         // RM_CONTROL - log first few bytes of params
+                        let status = if param_buf.len() >= 4 {
+                            u32::from_le_bytes([
+                                param_buf[0],
+                                param_buf[1],
+                                param_buf[2],
+                                param_buf[3],
+                            ])
+                        } else {
+                            0
+                        };
                         log::info!(
-                            "RM_CONTROL response[0..32]: {:02x?}",
-                            &param_buf[..std::cmp::min(32, param_buf.len())]
+                            "RM_CONTROL response: status={:#x}, data[4..32]={:02x?}",
+                            status,
+                            &param_buf[4..std::cmp::min(32, param_buf.len())]
                         );
                     }
                     0x2b => {
                         // RM_ALLOC - log first few bytes
+                        let status = if param_buf.len() >= 4 {
+                            u32::from_le_bytes([
+                                param_buf[0],
+                                param_buf[1],
+                                param_buf[2],
+                                param_buf[3],
+                            ])
+                        } else {
+                            0
+                        };
                         log::info!(
-                            "RM_ALLOC response[0..32]: {:02x?}",
-                            &param_buf[..std::cmp::min(32, param_buf.len())]
+                            "RM_ALLOC response: status={:#x}, data[4..32]={:02x?}",
+                            status,
+                            &param_buf[4..std::cmp::min(32, param_buf.len())]
                         );
                     }
                     _ => {}
