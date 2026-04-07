@@ -554,21 +554,18 @@ impl NvidiaBackend {
 
         let mut param_buf = param_in.to_vec();
 
-        // Special handling: NV_ESC_SYS_PARAMS (0xd6) - try V2 if EBUSY
-        // Some sysparams ioctls return EBUSY when the device is busy
-        if escape == 0xd6 && param_buf.len() >= 4 {
-            // Try setting Cmd to V2 (2) if it looks like a query
-            // The first 4 bytes are typically cmd/size
-            if param_buf[0] == 0 {
-                param_buf[0] = 2; // Try V2
-            }
+        // Special handling: NV_ESC_SYS_PARAMS (0xd6) - retry with different Cmd on EBUSY
+        // Some sysparams ioctls return EBUSY when the device is busy, especially
+        // during early initialization. We retry with Cmd=2 (V2) as fallback.
+        let mut retry_with_v2 = false;
+        if escape == 0xd6 && param_buf.len() >= 4 && param_buf[0] == 0 {
+            retry_with_v2 = true;
         }
 
         // ---------------------------------------------------------------
         // Special handling: NV_ESC_CHECK_VERSION_STR (0xd2)
         // Based on gVisor nvproxy: Try Cmd='2' first (character '2'),
         // which triggers version query mode in newer drivers.
-        // Fall back to Cmd=0 if that returns empty string.
         // ---------------------------------------------------------------
         if escape == 0xd2 && param_buf.len() >= 4 {
             // Try Cmd='2' first (query mode in newer drivers)
@@ -579,13 +576,51 @@ impl NvidiaBackend {
         let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            log::warn!(
-                "ioctl(0x{:x}/0x{:02x}) failed: errno={}",
-                request,
-                escape,
-                errno
-            );
-            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+
+            // Special handling: NV_ESC_SYS_PARAMS (0xd6) - retry on EBUSY
+            if escape == 0xd6 && errno == libc::EBUSY && retry_with_v2 {
+                log::info!("NV_ESC_SYS_PARAMS: got EBUSY, retrying with Cmd=2");
+                param_buf[0] = 2; // Try V2
+                let rc2 =
+                    unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
+                if rc2 < 0 {
+                    let errno2 = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    log::warn!(
+                        "ioctl(0x{:x}/0x{:02x}) retry failed: errno={}",
+                        request,
+                        escape,
+                        errno2
+                    );
+                    // EBUSY means driver is busy but shouldn't cause vulkan failure.
+                    // Synthesize success (like older drivers did) by returning zeros.
+                    log::warn!(
+                        "ioctl(0x{:x}/0x{:02x}) returned EBUSY - synthesizing success",
+                        request,
+                        escape
+                    );
+                    // Return success with zeroed params (simulates what driver returns)
+                    let zeroed = vec![0u8; param_buf.len()];
+                    return self.write_ioctl_resp(resp_buf, cookie, &zeroed);
+                }
+                // Success on retry - continue to response handling
+            } else if escape == 0xd6 && errno == libc::EBUSY {
+                // EBUSY but couldn't retry (param[0] != 0) - synthesize success
+                log::warn!(
+                    "ioctl(0x{:x}/0x{:02x}) returned EBUSY (no retry) - synthesizing success",
+                    request,
+                    escape
+                );
+                let zeroed = vec![0u8; param_buf.len()];
+                return self.write_ioctl_resp(resp_buf, cookie, &zeroed);
+            } else {
+                log::warn!(
+                    "ioctl(0x{:x}/0x{:02x}) failed: errno={}",
+                    request,
+                    escape,
+                    errno
+                );
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+            }
         } else {
             if log_response {
                 let preview = &param_buf[..std::cmp::min(param_buf.len(), 128)];
