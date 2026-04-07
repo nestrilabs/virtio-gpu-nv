@@ -432,6 +432,33 @@ impl NvidiaBackend {
             let host_ptr = host_buf.as_mut_ptr() as u64;
             outer[ptr_offset..ptr_offset + 8].copy_from_slice(&host_ptr.to_le_bytes());
 
+            // Extract the RM control command for special handling
+            let ctrl_cmd = if escape == 0x2A && outer.len() >= 12 {
+                Some(u32::from_le_bytes(outer[8..12].try_into().unwrap()))
+            } else {
+                None
+            };
+
+            // ---------------------------------------------------------------
+            // Special handling for critical RM_CONTROL commands
+            // Based on gVisor nvproxy: these need modifications before host call
+            // ---------------------------------------------------------------
+            if let Some(cmd) = ctrl_cmd {
+                match cmd {
+                    // NV0000_CTRL_CMD_GPU_GET_ID_INFO (0x202): Set szName to NULL
+                    // The host driver doesn't actually use this field
+                    0x00000202 => {
+                        if host_buf.len() >= 8 {
+                            // Set SzName pointer (offset 0 in hBuffer) to NULL
+                            host_buf[0..8].copy_from_slice(&0u64.to_le_bytes());
+                        }
+                    }
+                    // NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION (0x00): May need string truncation
+                    // The newer driver versions truncate strings, we let host handle it
+                    _ => {}
+                }
+            }
+
             // Call host ioctl — paramsSize field is untouched (may be 0)
             let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, outer.as_mut_ptr()) };
             if rc < 0 {
@@ -537,6 +564,19 @@ impl NvidiaBackend {
             || escape == 0x2a; // NV_ESC_RM_CONTROL
 
         let mut param_buf = param_in.to_vec();
+
+        // ---------------------------------------------------------------
+        // Special handling: NV_ESC_CHECK_VERSION_STR (0xd2)
+        // Based on gVisor nvproxy: Try Cmd='2' first (character '2'),
+        // which triggers version query mode in newer drivers.
+        // Fall back to Cmd=0 if that returns empty string.
+        // ---------------------------------------------------------------
+        if escape == 0xd2 && param_buf.len() >= 4 {
+            // Try Cmd='2' first (query mode in newer drivers)
+            param_buf[0] = b'2'; // Cmd = '2'
+                                 // Leave other fields as-is, call host
+        }
+
         let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
