@@ -176,6 +176,8 @@ impl NvidiaBackend {
             }
         };
 
+        log::info!("handle_open: opening {:?}", path);
+
         let raw_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
 
         if raw_fd < 0 {
@@ -186,7 +188,12 @@ impl NvidiaBackend {
         }
 
         let guest_handle = self.handles.insert(unsafe { OwnedFd::from_raw_fd(raw_fd) });
-        log::debug!("open {:?} → handle={}", path, guest_handle);
+        log::info!(
+            "handle_open: {:?} → handle={} (fd={})",
+            path,
+            guest_handle,
+            raw_fd
+        );
 
         write_ok(resp_buf, cookie, &OpenResp { guest_handle })
     }
@@ -345,6 +352,21 @@ impl NvidiaBackend {
 
         let escape = (request & 0xFF) as u32;
 
+        // Log RM_CONTROL/RM_ALLOC for debugging Vulkan init
+        if escape == 0x2A && outer.len() >= 12 {
+            let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
+            log::info!(
+                "RM_CONTROL cmd=0x{:x} (hClient={}, hObject={})",
+                cmd,
+                u32::from_le_bytes(outer[0..4].try_into().unwrap()),
+                u32::from_le_bytes(outer[4..8].try_into().unwrap())
+            );
+        }
+        if escape == 0x2B && outer.len() >= 16 {
+            let hClass = u32::from_le_bytes(outer[12..16].try_into().unwrap());
+            log::info!("RM_ALLOC hClass=0x{:x}", hClass);
+        }
+
         if !nested_in.is_empty() {
             // Guest sent nested params — allocate host buffer, point struct at it
             let nested_size = nested_in.len();
@@ -497,20 +519,66 @@ impl NvidiaBackend {
         param_in: &[u8],
         resp_buf: &mut [u8],
     ) -> usize {
+        let escape = (request & 0xFF) as u32;
         log::debug!(
-            "dispatch_simple: host_fd={} request=0x{:x} size={}",
+            "dispatch_simple: host_fd={} request=0x{:x} escape=0x{:02x} size={}",
             host_fd,
             request,
+            escape,
             param_in.len()
         );
+
+        // Debug logging for Vulkan-critical ioctls
+        let log_response = escape == 0xd2  // NV_ESC_CHECK_VERSION_STR
+            || escape == 0xc8  // NV_ESC_CARD_INFO
+            || escape == 0xd6  // NV_ESC_SYS_PARAMS
+            || escape == 0xd7  // NV_ESC_QUERY_DEVICE_INTR
+            || escape == 0x2b // NV_ESC_RM_ALLOC (hClient)
+            || escape == 0x2a; // NV_ESC_RM_CONTROL
+
         let mut param_buf = param_in.to_vec();
         let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            log::warn!("ioctl(0x{:x}) failed: errno={}", request, errno);
+            log::warn!(
+                "ioctl(0x{:x}/0x{:02x}) failed: errno={}",
+                request,
+                escape,
+                errno
+            );
             return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
         } else {
-            let escape = (request & 0xFF) as u32;
+            if log_response {
+                let preview = &param_buf[..std::cmp::min(param_buf.len(), 128)];
+                match escape {
+                    0xd2 => {
+                        // NV_ESC_CHECK_VERSION_STR - version string at offset 0
+                        let version = String::from_utf8_lossy(preview);
+                        log::info!("CHECK_VERSION_STR response: {:?}", version);
+                    }
+                    0xc8 => {
+                        log::info!("CARD_INFO response[0..128]: {:02x?}", preview);
+                    }
+                    0xd6 => {
+                        log::info!("SYS_PARAMS response[0..128]: {:02x?}", preview);
+                    }
+                    0x2a => {
+                        // RM_CONTROL - log first few bytes of params
+                        log::info!(
+                            "RM_CONTROL response[0..32]: {:02x?}",
+                            &param_buf[..std::cmp::min(32, param_buf.len())]
+                        );
+                    }
+                    0x2b => {
+                        // RM_ALLOC - log first few bytes
+                        log::info!(
+                            "RM_ALLOC response[0..32]: {:02x?}",
+                            &param_buf[..std::cmp::min(32, param_buf.len())]
+                        );
+                    }
+                    _ => {}
+                }
+            }
             if escape == 0x57 || escape == 0x58 {
                 log::info!(
                     "MAP/UNMAP_DMA(0x{:02x}): response[{}]={:02x?}",
