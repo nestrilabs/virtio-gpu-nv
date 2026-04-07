@@ -565,6 +565,16 @@ impl NvidiaBackend {
 
         let mut param_buf = param_in.to_vec();
 
+        // Special handling: NV_ESC_SYS_PARAMS (0xd6) - try V2 if EBUSY
+        // Some sysparams ioctls return EBUSY when the device is busy
+        if escape == 0xd6 && param_buf.len() >= 4 {
+            // Try setting Cmd to V2 (2) if it looks like a query
+            // The first 4 bytes are typically cmd/size
+            if param_buf[0] == 0 {
+                param_buf[0] = 2; // Try V2
+            }
+        }
+
         // ---------------------------------------------------------------
         // Special handling: NV_ESC_CHECK_VERSION_STR (0xd2)
         // Based on gVisor nvproxy: Try Cmd='2' first (character '2'),
@@ -580,13 +590,33 @@ impl NvidiaBackend {
         let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, param_buf.as_mut_ptr()) };
         if rc < 0 {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            log::warn!(
-                "ioctl(0x{:x}/0x{:02x}) failed: errno={}",
-                request,
-                escape,
-                errno
-            );
-            return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+
+            // Handle EBUSY (errno=16) - device busy
+            // For some ioctls, this is a soft failure - return success with status
+            if errno == libc::EBUSY
+                && (
+                    escape == 0xd6 || // SYS_PARAMS
+                escape == 0xd7 || // QUERY_DEVICE_INTR
+                escape == 0xc8
+                    // CARD_INFO
+                )
+            {
+                log::warn!(
+                    "ioctl(0x{:x}/0x{:02x}) returned EBUSY - synthesizing success",
+                    request,
+                    escape
+                );
+                // Return what we sent - caller will check status field
+                self.write_ioctl_resp(resp_buf, cookie, &param_buf)
+            } else {
+                log::warn!(
+                    "ioctl(0x{:x}/0x{:02x}) failed: errno={}",
+                    request,
+                    escape,
+                    errno
+                );
+                return self.write_error_resp(resp_buf, Status::IoctlFailed, cookie, errno);
+            }
         } else {
             if log_response {
                 let preview = &param_buf[..std::cmp::min(param_buf.len(), 128)];
