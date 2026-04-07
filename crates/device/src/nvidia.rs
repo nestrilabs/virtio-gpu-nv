@@ -443,21 +443,10 @@ impl NvidiaBackend {
             // Special handling for critical RM_CONTROL commands
             // Based on gVisor nvproxy: these need modifications before host call
             // ---------------------------------------------------------------
-            if let Some(cmd) = ctrl_cmd {
-                match cmd {
-                    // NV0000_CTRL_CMD_GPU_GET_ID_INFO (0x202): Set szName to NULL
-                    // The host driver doesn't actually use this field
-                    0x00000202 => {
-                        if host_buf.len() >= 8 {
-                            // Set SzName pointer (offset 0 in hBuffer) to NULL
-                            host_buf[0..8].copy_from_slice(&0u64.to_le_bytes());
-                        }
-                    }
-                    // NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION (0x00): May need string truncation
-                    // The newer driver versions truncate strings, we let host handle it
-                    _ => {}
-                }
-            }
+            // Note: No special cmd handling needed - all cmd params are passed as-is
+            // to the host. Any pointer/buffer handling is done by the guest via
+            // separate mmap operations.
+            // ---------------------------------------------------------------
 
             // Call host ioctl — paramsSize field is untouched (may be 0)
             let rc = unsafe { libc::ioctl(host_fd, request as libc::Ioctl, outer.as_mut_ptr()) };
@@ -517,11 +506,11 @@ impl NvidiaBackend {
             if escape == 0x2a {
                 let status = u32::from_le_bytes(outer[28..32].try_into().unwrap());
                 let cmd = u32::from_le_bytes(outer[8..12].try_into().unwrap());
-                log::debug!("(else) RM_CONTROL cmd=0x{:08x} status=0x{:x}", cmd, status);
+                log::info!("(else) RM_CONTROL cmd=0x{:08x} status=0x{:x}", cmd, status);
             } else if escape == 0x2b {
                 let status = u32::from_le_bytes(outer[40..44].try_into().unwrap());
                 let hclass = u32::from_le_bytes(outer[12..16].try_into().unwrap());
-                log::debug!(
+                log::info!(
                     "(else) RM_ALLOC hClass=0x{:04x} status=0x{:x}",
                     hclass,
                     status
