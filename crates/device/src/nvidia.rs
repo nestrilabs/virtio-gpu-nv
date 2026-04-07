@@ -607,7 +607,7 @@ impl NvidiaBackend {
                     escape
                 );
                 // Return what we sent - caller will check status field
-                self.write_ioctl_resp(resp_buf, cookie, &param_buf)
+                return self.write_ioctl_resp(resp_buf, cookie, &param_buf);
             } else {
                 log::warn!(
                     "ioctl(0x{:x}/0x{:02x}) failed: errno={}",
