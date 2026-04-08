@@ -1,0 +1,8 @@
+config VIRTIO_GPU_NV
+    bool "Virtio NVIDIA GPU proxy driver"
+    depends on VIRTIO
+    default y
+    help
+        Provides /dev/nvidia* device files inside the VM that forward ioctls to the host's NVIDIA driver via a virtio control queue.
+        Memory mappings are exposed via KVM memory slots so GPU command submission runs at native speed without any VMM involvement.
+        Required for CUDA, Vulkan, NVENC, and NVDEC inside a libkrun VM.If unsure, say N.

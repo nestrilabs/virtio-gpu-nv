@@ -5,6 +5,8 @@ KERNEL_SOURCES = $(KERNEL_VERSION)
 KERNEL_PATCHES = $(shell find patches/ -name "0*.patch" | sort)
 KERNEL_C_BUNDLE = kernel.c
 
+NESTRI_DRIVERS_SRC = $(shell find nvgpu -type f 2>/dev/null)
+
 ABI_VERSION = 5
 FULL_VERSION = 5.3.0
 TIMESTAMP = "Tue Mar 10 13:28:56 CET 2026"
@@ -90,10 +92,15 @@ $(KERNEL_TARBALL):
 $(KERNEL_SOURCES): $(KERNEL_TARBALL)
 	tar xf $(KERNEL_TARBALL)
 	for patch in $(KERNEL_PATCHES); do patch -p1 -d $(KERNEL_SOURCES) < "$$patch"; done
+	cp -r nvgpu $(KERNEL_SOURCES)/drivers/virtio/nvgpu
+	@echo 'source "drivers/virtio/nvgpu/Kconfig"' >> $(KERNEL_SOURCES)/drivers/virtio/Kconfig
+	@echo 'obj-y += nvgpu/' >> $(KERNEL_SOURCES)/drivers/virtio/Make
 	cp config-libkrunfw$(VARIANT)_$(GUESTARCH) $(KERNEL_SOURCES)/.config
 	cd $(KERNEL_SOURCES) ; $(MAKE) olddefconfig
 
-$(KERNEL_BINARY_$(GUESTARCH)): $(KERNEL_SOURCES)
+$(KERNEL_BINARY_$(GUESTARCH)): $(KERNEL_SOURCES) $(NESTRI_DRIVERS_SRC)
+	@echo "Syncing updated drivers into the kernel tree..."
+	@rsync -a --delete nvgpu/ $(KERNEL_SOURCES)/drivers/virtio/nvgpu/
 	cd $(KERNEL_SOURCES) ; rm -f .version ; $(MAKE) $(MAKEFLAGS) $(KERNEL_FLAGS)
 
 ifeq ($(OS),Darwin)

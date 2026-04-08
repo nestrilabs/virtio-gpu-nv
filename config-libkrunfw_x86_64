@@ -2,6 +2,8 @@
 # Automatically generated file; DO NOT EDIT.
 # Linux/x86 6.6.59 Kernel Configuration
 #
+CONFIG_VIRTIO_GPU_NV=y
+
 CONFIG_CC_VERSION_TEXT="gcc (GCC) 14.0.1 20240411 (Red Hat 14.0.1-0)"
 CONFIG_CC_IS_GCC=y
 CONFIG_GCC_VERSION=140001
@@ -465,7 +467,7 @@ CONFIG_CPU_IDLE_GOV_MENU=y
 CONFIG_CPU_IDLE_GOV_HALTPOLL=y
 CONFIG_HALTPOLL_CPUIDLE=y
 # end of CPU Idle
- 
+
 # CONFIG_INTEL_IDLE is not set
 # end of Power management and ACPI options
 
