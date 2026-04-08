@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/abi",
+    "crates/device",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+protocol = { path = "crates/protocol" }
+abi      = { path = "crates/abi" }

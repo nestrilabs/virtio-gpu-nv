@@ -1,0 +1,4 @@
+[package]
+name = "protocol"
+version.workspace = true
+edition.workspace = true
