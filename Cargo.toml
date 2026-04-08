@@ -1,0 +1,11 @@
+[workspace]
+members = ["src/libkrun", "src/krun_input"]
+exclude = ["examples/gtk_display"]
+resolver = "2"
+
+[profile.dev]
+#panic = "abort"
+
+[profile.release]
+#panic = "abort"
+lto = true

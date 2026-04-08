@@ -1,0 +1,4 @@
+[submodule "third-party/build/win"]
+  path = libkrunfw-nv
+  url = ./
+  branch = libkrunfw
