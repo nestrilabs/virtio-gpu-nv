@@ -1,4 +1,4 @@
-[submodule "third-party/build/win"]
-  path = libkrunfw-nv
-  url = ./
-  branch = libkrunfw
+[submodule "libkrunfw-nvgpu"]
+	path = libkrunfw-nvgpu
+	url = ./
+	branch = libkrunfw
