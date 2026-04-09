@@ -175,6 +175,7 @@ pub(crate) struct HostFd {
     /// The actual host file descriptor.
     pub fd: std::fs::File,
     /// NVGPU_DEV_* constant.
+    #[allow(unused)]
     pub device_type: u32,
     /// Mapping IDs associated with this FD — cleaned up on close.
     pub mapping_ids: Vec<u32>,
@@ -191,6 +192,7 @@ pub(crate) struct GpuMapping {
     /// KVM memory slot index used for this mapping.
     pub kvm_slot: u32,
     /// Back-reference to the owning host FD handle.
+    #[allow(unused)]
     pub host_fd_handle: u32,
 }
 
@@ -205,6 +207,7 @@ unsafe impl Sync for GpuMapping {}
 /// Bump allocator for guest physical addresses in the GPU MMIO window.
 /// The window must be outside guest RAM so KVM does not confuse it with RAM.
 pub(crate) struct MmioAllocator {
+    #[allow(unused)]
     base: u64,
     next: u64,
     limit: u64,

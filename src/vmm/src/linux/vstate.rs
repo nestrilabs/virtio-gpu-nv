@@ -825,7 +825,7 @@ impl Vm {
     }
 
     /// Gets a reference to the kvm file descriptor owned by this VM.
-    pub fn fd(&self) -> &VmFd {
+    pub fn fd(&self) -> &std::sync::Arc<VmFd> {
         &self.fd
     }
 
