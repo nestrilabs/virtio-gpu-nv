@@ -7,3 +7,5 @@
 **/tarballs
 **/linux-*
 **/target
+/libkrun.pc
+init/init

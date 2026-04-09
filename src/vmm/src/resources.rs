@@ -278,6 +278,10 @@ impl VmResources {
         Ok(())
     }
 
+    pub fn set_nvgpu_config(&mut self, nvidia_config: devices::virtio::gpu_nv::GpuNvConfig) {
+        self.nvidia_config = Some(nvidia_config);
+    }
+
     pub fn external_kernel(&self) -> Option<&ExternalKernel> {
         self.external_kernel.as_ref()
     }

@@ -586,6 +586,7 @@ fn attach_nvgpu_device(
 
     Ok(gpu_nv)
 }
+//FIX: Prevent setting virgl flags and setting up nvgpu device at the same time.
 
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
 ///

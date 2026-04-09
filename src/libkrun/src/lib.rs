@@ -1,6 +1,12 @@
 #[macro_use]
 extern crate log;
 
+use devices::virtio::gpu_nv::version::DriverVersion;
+use devices::virtio::gpu_nv::{
+    GpuNvConfig, NVGPU_CAP_COMPUTE, NVGPU_CAP_GRAPHICS, NVGPU_CAP_UTILITY, NVGPU_CAP_VIDEO,
+};
+use std::path::Path;
+
 use crossbeam_channel::unbounded;
 #[cfg(feature = "blk")]
 use devices::virtio::block::{ImageType, SyncMode};
@@ -603,6 +609,106 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
     KRUN_SUCCESS
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn krun_enable_nvgpu(
+    ctx_id: u32,
+    gpu_ids: *const libc::c_char,
+    caps: *const libc::c_char,
+) -> i32 {
+    // ── Detect host driver version ────────────────────────────────────────
+    let version = match DriverVersion::detect() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("krun_enable_nvidia: {}", e);
+            return -libc::ENODEV;
+        }
+    };
+
+    // ── Parse GPU IDs ─────────────────────────────────────────────────────
+    let gpu_list: Vec<u32> = if gpu_ids.is_null() {
+        vec![0]
+    } else {
+        let s = CStr::from_ptr(gpu_ids).to_str().unwrap_or("0");
+        s.split(',')
+            .filter_map(|x| x.trim().parse::<u32>().ok())
+            .collect()
+    };
+
+    if gpu_list.is_empty() {
+        return -libc::EINVAL;
+    }
+
+    // ── Parse capabilities ────────────────────────────────────────────────
+    let caps_val: u32 = if caps.is_null() {
+        NVGPU_CAP_COMPUTE | NVGPU_CAP_GRAPHICS | NVGPU_CAP_VIDEO | NVGPU_CAP_UTILITY
+    } else {
+        let s = CStr::from_ptr(caps).to_str().unwrap_or("all");
+        parse_caps(s)
+    };
+
+    // ── Verify host device nodes are accessible ───────────────────────────
+    for &gpu_id in &gpu_list {
+        let path = format!("/dev/nvidia{}", gpu_id);
+        if !Path::new(&path).exists() {
+            eprintln!("krun_enable_nvidia: {} not found", path);
+            return -libc::ENODEV;
+        }
+    }
+
+    if !Path::new("/dev/nvidiactl").exists() {
+        eprintln!("krun_enable_nvidia: /dev/nvidiactl not found");
+        return -libc::ENODEV;
+    }
+
+    // ── Store config in the context ───────────────────────────────────────
+    let config = GpuNvConfig {
+        num_gpus: gpu_list.len() as u32,
+        caps: caps_val,
+        driver_version: version.as_string(),
+    };
+
+    // CTX_MAP is the existing global context map used by libkrun.
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => ctx_cfg.get_mut().vmr.set_nvgpu_config(config),
+        Entry::Vacant(_) => return -libc::ENOENT,
+    }
+
+    // TODO: Is this really needed? As we mount the host as /, so we get the full host nvidia files
+    // // ── Auto-discover NVIDIA libraries and add a virtio-fs share ─────────
+    // if let Ok(lib_path) = find_nvidia_libs() {
+    //     let path_str = match lib_path.to_str() {
+    //         Some(s) => s.to_string(),
+    //         None => return -libc::EINVAL,
+    //     };
+    //     // krun_add_virtiofs2 is the existing libkrun API.
+    //     // The "nvidia-libs" tag is the virtiofs mount tag the guest uses.
+    //     let tag = b"nvidia-libs\0";
+    //     let cpath = std::ffi::CString::new(path_str).unwrap();
+    //     crate::krun_add_virtiofs2(ctx_id, tag.as_ptr() as _, cpath.as_ptr());
+    // }
+
+    KRUN_SUCCESS
+}
+
+fn parse_caps(s: &str) -> u32 {
+    let mut caps = 0u32;
+    for part in s.split(',') {
+        match part.trim() {
+            "compute" => caps |= NVGPU_CAP_COMPUTE,
+            "graphics" => caps |= NVGPU_CAP_GRAPHICS,
+            "video" => caps |= NVGPU_CAP_VIDEO,
+            "utility" => caps |= NVGPU_CAP_UTILITY,
+            "all" => caps = 0xF,
+            _ => {}
+        }
+    }
+    // Default to all if nothing matched.
+    if caps == 0 {
+        0xF
+    } else {
+        caps
+    }
+}
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 #[cfg(not(feature = "tee"))]
