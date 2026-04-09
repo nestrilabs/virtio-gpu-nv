@@ -13,6 +13,7 @@ use std::cell::Cell;
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::ops::Range;
+use std::sync::Arc;
 
 use std::os::unix::io::RawFd;
 
@@ -487,7 +488,7 @@ impl KvmContext {
 
 /// A wrapper around creating and using a VM.
 pub struct Vm {
-    fd: VmFd,
+    fd: Arc<VmFd>,
     next_mem_slot: u32,
 
     // X86 specific fields.
@@ -524,7 +525,7 @@ impl Vm {
             arch::x86_64::msr::supported_guest_msrs(kvm).map_err(Error::GuestMSRs)?;
 
         Ok(Vm {
-            fd: vm_fd,
+            fd: Arc::new(vm_fd),
             next_mem_slot: 0,
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             supported_cpuid,
@@ -826,6 +827,11 @@ impl Vm {
     /// Gets a reference to the kvm file descriptor owned by this VM.
     pub fn fd(&self) -> &VmFd {
         &self.fd
+    }
+
+    // Return fd with a "shared ownership" handle (Arc)
+    pub fn fd_shared(&self) -> std::sync::Arc<kvm_ioctls::VmFd> {
+        self.fd.clone() // This clones the Arc (the pointer), NOT the VmFd itself.
     }
 
     #[allow(unused)]

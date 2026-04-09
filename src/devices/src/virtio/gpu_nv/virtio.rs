@@ -27,9 +27,11 @@ impl VirtioDevice for GpuNv {
     fn set_acked_features(&mut self, acked_features: u64) {
         self.acked_features = acked_features & self.avail_features;
     }
+
     fn device_type(&self) -> u32 {
         VIRTIO_ID_GPU_NV
     }
+
     fn device_name(&self) -> &str {
         "virtio-nvgpu"
     }

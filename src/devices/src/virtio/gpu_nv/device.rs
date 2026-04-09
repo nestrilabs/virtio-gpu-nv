@@ -4,6 +4,7 @@
 
 use crate::virtio::gpu_nv::{NVGPU_CAP_COMPUTE, NVGPU_CAP_GRAPHICS, NVGPU_CAP_VIDEO};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::virtio::gpu_nv::allowlist::AllowedIoctls;
 
@@ -110,7 +111,7 @@ pub struct GpuNv {
     pub(crate) mmio_alloc: MmioAllocator,
 
     /// KVM VM fd — used to create / delete memory slots.
-    pub(crate) vm_fd: std::sync::Arc<kvm_ioctls::VmFd>,
+    pub(crate) vm_fd: Arc<kvm_ioctls::VmFd>,
 
     /// Next KVM memory slot index.
     pub(crate) next_kvm_slot: u32,
@@ -132,7 +133,7 @@ impl GpuNv {
     /// comfortably covers typical workloads.
     pub fn new(
         config: GpuNvConfig,
-        vm_fd: std::sync::Arc<kvm_ioctls::VmFd>,
+        vm_fd: Arc<kvm_ioctls::VmFd>,
         mmio_base: u64,
         mmio_size: u64,
         first_kvm_slot: u32,
@@ -168,5 +169,9 @@ impl GpuNv {
             interrupt_transport: None,
             guest_memory: None,
         }
+    }
+
+    pub fn id(&self) -> u32 {
+        crate::virtio::gpu_nv::VIRTIO_ID_GPU_NV
     }
 }

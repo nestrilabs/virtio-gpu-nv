@@ -189,6 +189,7 @@ pub struct VmResources {
     pub serial_consoles: Vec<SerialConsoleConfig>,
     /// Virtio consoles to attach to the guest
     pub virtio_consoles: Vec<VirtioConsoleConfigMode>,
+    pub nvidia_config: Option<devices::virtio::gpu_nv::GpuNvConfig>,
 }
 
 impl VmResources {
@@ -431,6 +432,7 @@ mod tests {
             serial_consoles: Vec::new(),
             virtio_consoles: Vec::new(),
             kernel_console: None,
+            nvidia_config: None,
         }
     }
 

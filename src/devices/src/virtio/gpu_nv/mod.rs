@@ -21,6 +21,7 @@ pub use device::GpuNvConfig;
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub const VIRTIO_ID_GPU_NV: u32 = 45;
+pub const GPU_NV_DEVICE_ID: &str = "virtio-nvgpu";
 
 /// Message types on the control virtqueue.
 pub const NVGPU_MSG_OPEN: u32 = 1;

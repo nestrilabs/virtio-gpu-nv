@@ -553,6 +553,40 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
     }
 }
 
+fn attach_nvgpu_device(
+    vmm: &mut Vmm,
+    nvidia_config: devices::virtio::gpu_nv::GpuNvConfig,
+    intc: IrqChip,
+) -> Result<Arc<Mutex<devices::virtio::gpu_nv::GpuNv>>, StartMicrovmError> {
+    use devices::virtio::gpu_nv::GpuNv;
+
+    // Reserve a 4 GiB MMIO window above guest RAM for GPU memory mappings.
+    // Adjust base address to not overlap with the guest RAM region.
+    // 0x20_0000_0000 = 128 GiB — safely above 64 GiB of guest RAM.
+    const GPU_MMIO_BASE: u64 = 0x20_0000_0000;
+    const GPU_MMIO_SIZE: u64 = 0x1_0000_0000; // 4 GiB window
+
+    // Reserve KVM slots starting after the standard RAM + device slots.
+    // Typical libkrun uses slots 0-3 for RAM; start GPU slots at 100.
+    const FIRST_GPU_KVM_SLOT: u32 = 100;
+
+    let gpu_nv = GpuNv::new(
+        nvidia_config,
+        vmm.vm.fd_shared().clone(),
+        GPU_MMIO_BASE,
+        GPU_MMIO_SIZE,
+        FIRST_GPU_KVM_SLOT,
+    );
+
+    let gpu_nv = Arc::new(Mutex::new(gpu_nv));
+    let id = gpu_nv.lock().unwrap().id().to_string();
+
+    attach_mmio_device(vmm, id, intc, gpu_nv.clone())
+        .map_err(StartMicrovmError::RegisterGpuDevice)?;
+
+    Ok(gpu_nv)
+}
+
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
 ///
 /// This is the default build recipe, one could build other microVM flavors by using the
@@ -1043,6 +1077,14 @@ pub fn build_microvm(
         #[cfg(target_os = "macos")]
         _sender,
     )?;
+
+    let _gpu_nv_device = if let Some(nvidia_config) = vm_resources.nvidia_config.clone().take() {
+        let gpu_nv = attach_nvgpu_device(&mut vmm, nvidia_config, intc.clone())?;
+        Some(gpu_nv)
+    } else {
+        None
+    };
+
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
 
@@ -1122,6 +1164,12 @@ pub fn build_microvm(
     // but we don't want to change the event_manager interface
     #[allow(clippy::arc_with_non_send_sync)]
     let vmm = Arc::new(Mutex::new(vmm));
+    // if let Some(gpu_nv) = gpu_nv_device {
+    //     event_manager
+    //         .add_subscriber(gpu_nv)
+    //         .map_err(StartMicrovmError::RegisterEvent)?;
+    // }
+
     event_manager
         .add_subscriber(vmm.clone())
         .map_err(StartMicrovmError::RegisterEvent)?;
