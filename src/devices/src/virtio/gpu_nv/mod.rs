@@ -12,6 +12,7 @@ pub mod libs;
 pub mod mmap;
 pub mod version;
 pub mod virtio;
+pub mod worker;
 
 pub use device::GpuNv;
 pub use device::GpuNvConfig;
@@ -29,6 +30,7 @@ pub const NVGPU_MSG_CLOSE: u32 = 2;
 pub const NVGPU_MSG_IOCTL: u32 = 3;
 pub const NVGPU_MSG_MMAP: u32 = 4;
 pub const NVGPU_MSG_MUNMAP: u32 = 5;
+pub const NVGPU_MSG_GET_PROC_FILES: u32 = 6;
 
 /// device_type values for OPEN.
 pub const NVGPU_DEV_CTL: u32 = 255;

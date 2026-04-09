@@ -3,20 +3,17 @@
 // Request processing — dispatches incoming virtqueue messages from the guest
 // to the appropriate host-side handler.
 
-use std::os::unix::io::AsRawFd;
-
+use crate::virtio::gpu_nv::allowlist::AllowedIoctls;
 use crate::virtio::gpu_nv::device::HostFd;
-use crate::virtio::gpu_nv::{
-    bytes_of, ioc_nr, GpuNv, NvgpuIoctlReq, NvgpuIoctlResp, NvgpuMsgHdr, NvgpuOpenReq,
-    NvgpuOpenResp, NVGPU_MSG_CLOSE, NVGPU_MSG_IOCTL, NVGPU_MSG_MMAP, NVGPU_MSG_MUNMAP,
-    NVGPU_MSG_OPEN,
-};
+use crate::virtio::gpu_nv::worker::Worker;
+use crate::virtio::gpu_nv::{bytes_of, ioc_nr, NvgpuIoctlReq, NvgpuIoctlResp, NvgpuMsgHdr, NvgpuOpenReq, NvgpuOpenResp, NVGPU_MSG_CLOSE, NVGPU_MSG_GET_PROC_FILES, NVGPU_MSG_IOCTL, NVGPU_MSG_MMAP, NVGPU_MSG_MUNMAP, NVGPU_MSG_OPEN};
+use std::os::unix::io::AsRawFd;
 
 /// NVIDIA ioctl numbers that carry embedded pointers.
 const NV_ESC_RM_CONTROL: u32 = 0x2a;
 const NV_ESC_RM_ALLOC: u32 = 0x2b;
 
-impl GpuNv {
+impl Worker {
     // ─────────────────────────────────────────────────────────────────────────
     // Top-level dispatcher
     // ─────────────────────────────────────────────────────────────────────────
@@ -32,11 +29,10 @@ impl GpuNv {
         let hdr: NvgpuMsgHdr =
             unsafe { std::ptr::read_unaligned(req_buf.as_ptr() as *const NvgpuMsgHdr) };
 
-        let msg_type = hdr.msg_type;
-        let handle = hdr.handle;
-
         if std::env::var("NVGPU_LOG_IOCTLS").is_ok() {
-            eprintln!(
+            let msg_type = hdr.msg_type;
+            let handle = hdr.handle;
+            log::debug!(
                 "virtio-gpu-nv: msg_type={} handle={} buf_len={}",
                 msg_type,
                 handle,
@@ -50,6 +46,7 @@ impl GpuNv {
             NVGPU_MSG_IOCTL => self.handle_ioctl(req_buf),
             NVGPU_MSG_MMAP => self.handle_mmap(req_buf),
             NVGPU_MSG_MUNMAP => self.handle_munmap(req_buf),
+            NVGPU_MSG_GET_PROC_FILES => self.handle_get_proc_files(),
             _ => self.error_response(hdr.handle, -libc::ENOSYS),
         }
     }
@@ -154,7 +151,7 @@ impl GpuNv {
         // Security: reject unknown ioctl commands.
         let nr = ioc_nr(req.cmd);
         if !self.allowed_ioctls.is_allowed(nr) {
-            eprintln!("virtio-gpu-nv: blocked ioctl nr=0x{:02x}", nr);
+            log::debug!("virtio-gpu-nv: blocked ioctl nr=0x{:02x}", nr);
             return self.error_response(req.hdr.handle, -libc::ENOTTY);
         }
 
@@ -180,31 +177,93 @@ impl GpuNv {
         let nested_len = req.nested_len;
 
         if std::env::var("NVGPU_LOG_IOCTLS").is_ok() {
-            eprintln!(
+            log::error!(
                 "virtio-gpu-nv: ioctl handle={} cmd=0x{:x} nr=0x{:x} \
                  data_len={} nested_len={}",
-                handle, cmd, nr, data_len, nested_len
+                handle,
+                cmd,
+                nr,
+                data_len,
+                nested_len
             );
         }
 
         // Route to simple or complex path.
+        // In handle_ioctl, replace the match arm:
         match nr {
             NV_ESC_RM_CONTROL | NV_ESC_RM_ALLOC => self.execute_complex_ioctl(&req, data, nested),
-            _ => self.execute_simple_ioctl(&req, data),
+            _ => {
+                // Check fd-translation table before falling through to simple path.
+                if let Some(entry) = AllowedIoctls::fd_translation(nr) {
+                    self.execute_fd_translation_ioctl(&req, data, entry.payload_offset)
+                } else {
+                    self.execute_simple_ioctl(&req, data)
+                }
+            }
         }
+    }
+
+    /// Generic handler for ioctls that carry a guest fd at a known payload offset.
+    /// Translates handle → host fd number, then forwards as a normal simple ioctl.
+    fn execute_fd_translation_ioctl(
+        &mut self,
+        req: &NvgpuIoctlReq,
+        data: &[u8],
+        payload_offset: usize,
+    ) -> Vec<u8> {
+        // Bounds-check: we need 4 bytes at payload_offset.
+        if data.len() < payload_offset + 4 {
+            return self.error_response(req.hdr.handle, -libc::EINVAL);
+        }
+
+        // Guest driver placed the VMM handle here, not a raw fd number.
+        let other_handle =
+            u32::from_le_bytes(data[payload_offset..payload_offset + 4].try_into().unwrap());
+
+        // Resolve handle → host fd number.
+        let other_raw_fd = match self.fd_table.get(&other_handle) {
+            Some(f) => f.fd.as_raw_fd(),
+            None => {
+                log::error!(
+                    "virtio-gpu-nv: fd-translation ioctl nr=0x{:x}: \
+                 unknown handle {}",
+                    ioc_nr(req.cmd),
+                    other_handle
+                );
+                return self.error_response(req.hdr.handle, -libc::EBADF);
+            }
+        };
+
+        // Build a patched copy of the data with the real host fd in place.
+        let mut buf = data.to_vec();
+        buf[payload_offset..payload_offset + 4]
+            .copy_from_slice(&(other_raw_fd as u32).to_le_bytes());
+
+        if std::env::var("NVGPU_LOG_IOCTLS").is_ok() {
+            let handle = req.hdr.handle;
+            log::error!(
+                "virtio-gpu-nv: fd-translation nr=0x{:x} handle={} \
+             other_handle={} -> host_fd={}",
+                ioc_nr(req.cmd),
+                handle,
+                other_handle,
+                other_raw_fd
+            );
+        }
+
+        // Now it's just a normal simple ioctl with the patched buffer.
+        self.execute_simple_ioctl_with_buf(req, buf)
     }
 
     // ── Simple ioctl: flat struct, no embedded pointers ──────────────────────
 
-    fn execute_simple_ioctl(&mut self, req: &NvgpuIoctlReq, data: &[u8]) -> Vec<u8> {
+    /// Issue the ioctl with a pre-built mutable buffer and return the response.
+    fn execute_simple_ioctl_with_buf(&mut self, req: &NvgpuIoctlReq, mut buf: Vec<u8>) -> Vec<u8> {
         let handle = req.hdr.handle;
         let host_fd = match self.fd_table.get(&handle) {
             Some(f) => f,
-            None => return self.error_response(req.hdr.handle, -libc::EBADF),
+            None => return self.error_response(handle, -libc::EBADF),
         };
-
-        // Copy data into a mutable buffer — the ioctl may write back in place.
-        let mut buf = data.to_vec();
 
         let ret = unsafe {
             libc::ioctl(
@@ -214,8 +273,20 @@ impl GpuNv {
             )
         };
 
+        let errno = if ret < 0 { errno_val() } else { 0 };
+
+        if std::env::var("NVGPU_LOG_IOCTLS").is_ok() && ioc_nr(req.cmd) == 0xc9 {
+            log::error!(
+                "virtio-gpu-nv: CARD_INFO/REGISTER_FD nr=0xc9 \
+             ret={} errno={} buf={:02x?}",
+                ret,
+                errno,
+                &buf[..buf.len().min(16)]
+            );
+        }
+
         let (status, out_len) = if ret < 0 {
-            (-errno_val(), 0u32)
+            (-errno, 0u32)
         } else {
             (ret as i32, buf.len() as u32)
         };
@@ -223,7 +294,7 @@ impl GpuNv {
         let resp_hdr = NvgpuIoctlResp {
             hdr: NvgpuMsgHdr {
                 msg_type: NVGPU_MSG_IOCTL,
-                handle: req.hdr.handle,
+                handle,
                 status,
                 padding: 0,
             },
@@ -236,6 +307,10 @@ impl GpuNv {
             out.extend_from_slice(&buf);
         }
         out
+    }
+
+    fn execute_simple_ioctl(&mut self, req: &NvgpuIoctlReq, data: &[u8]) -> Vec<u8> {
+        self.execute_simple_ioctl_with_buf(req, data.to_vec())
     }
 
     // ── Complex ioctl: NV_ESC_RM_CONTROL / NV_ESC_RM_ALLOC ──────────────────
@@ -291,7 +366,6 @@ impl GpuNv {
                 top.as_mut_ptr() as *mut libc::c_void,
             )
         };
-
         let status = if ret < 0 { -errno_val() } else { ret as i32 };
 
         // Restore the original guest pointer so the guest driver can use it
@@ -313,6 +387,33 @@ impl GpuNv {
         out.extend_from_slice(&top);
         out.extend_from_slice(&nested_buf);
         out
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // GET_PROC_FILES — send entire /proc/driver/nvidia tree to guest
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn handle_get_proc_files(&self) -> Vec<u8> {
+        let mut payload: Vec<u8> = Vec::new();
+
+        for f in &self.config.extra_proc {
+            let path    = f.guest_path.as_bytes();
+            let content = f.content.as_bytes();
+            payload.extend_from_slice(&(path.len()    as u32).to_le_bytes());
+            payload.extend_from_slice(&(content.len() as u32).to_le_bytes());
+            payload.extend_from_slice(path);
+            payload.extend_from_slice(content);
+        }
+
+        // Terminator
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+
+        log::debug!(
+        "virtio-gpu-nv: GET_PROC_FILES {} files {} bytes",
+        self.config.extra_proc.len(), payload.len()
+    );
+        payload
     }
 
     // ─────────────────────────────────────────────────────────────────────────

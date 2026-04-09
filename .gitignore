@@ -9,3 +9,5 @@
 **/target
 /libkrun.pc
 init/init
+.idea/
+.vscode/

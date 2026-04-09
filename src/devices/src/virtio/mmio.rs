@@ -424,7 +424,7 @@ impl BusDevice for MmioTransport {
                 };
                 byte_order::write_le_u32(data, v);
             }
-            0x100..=0xfff => self.locked_device().read_config(offset - 0x100, data),
+            0x100..=0x3FFF => self.locked_device().read_config(offset - 0x100, data),
             _ => {
                 warn!(
                     "invalid virtio mmio read: 0x{:x}:0x{:x}",
@@ -495,7 +495,7 @@ impl BusDevice for MmioTransport {
                     }
                 }
             }
-            0x100..=0xfff => {
+            0x100..=0x3FFF => {
                 if self.check_device_status(device_status::DRIVER, device_status::FAILED) {
                     self.locked_device().write_config(offset - 0x100, data)
                 } else {

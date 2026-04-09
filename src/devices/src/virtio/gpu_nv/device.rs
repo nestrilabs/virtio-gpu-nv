@@ -9,6 +9,145 @@ use std::sync::Arc;
 use crate::virtio::gpu_nv::allowlist::AllowedIoctls;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Generic host→guest proc file passthrough
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One host procfs file to be recreated verbatim in the guest.
+#[derive(Debug, Clone)]
+pub struct HostProcFile {
+    /// Path relative to /proc — e.g. "driver/nvidia/gpus/0000:08:00.0/information"
+    pub guest_path: String,
+    /// Raw file content read from the host.
+    pub content: String,
+}
+
+/// Recursively walk /proc/driver/nvidia/ and capture every readable file.
+pub fn read_host_nvidia_proc_tree() -> Vec<HostProcFile> {
+    let root = std::path::Path::new("/proc/driver/nvidia");
+    let mut files = Vec::new();
+    walk_proc_dir(root, &mut files);
+    log::info!("virtio-gpu-nv: captured {} host proc files", files.len());
+    files
+}
+
+fn walk_proc_dir(dir: &std::path::Path, out: &mut Vec<HostProcFile>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => { log::warn!("virtio-gpu-nv: cannot read {}: {}", dir.display(), e); return; }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            walk_proc_dir(&path, out);
+            continue;
+        }
+        if !meta.is_file() { continue; }
+        let relative = match path.strip_prefix("/proc/") {
+            Ok(r) => r.to_string_lossy().to_string(),
+            Err(_) => continue,
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                log::debug!("virtio-gpu-nv: captured {}", relative);
+                out.push(HostProcFile { guest_path: relative, content });
+            }
+            Err(e) => log::debug!("virtio-gpu-nv: skipping {}: {}", relative, e),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GPU info — only what we need to identify the device; rest travels as raw text
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct GpuInfo {
+    /// PCI address string — used as the proc subdirectory name.
+    pub pci_addr: String,
+    /// Device minor number — used for /dev/nvidia<minor> matching.
+    pub minor: u32,
+    /// Raw content of /proc/driver/nvidia/gpus/<pci>/information on the host.
+    pub information: HostProcFile,
+}
+
+fn parse_gpu_information(pci_addr: &str, text: &str) -> Option<GpuInfo> {
+    let mut minor = None;
+
+    for line in text.lines() {
+        let parts: Vec<&str> = line.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        if parts[0].trim() == "Device Minor" {
+            minor = parts[1].trim().parse::<u32>().ok();
+            break; // only field we need to parse
+        }
+    }
+
+    let pci_addr = pci_addr.to_string();
+    Some(GpuInfo {
+        information: HostProcFile {
+            guest_path: format!("driver/nvidia/gpus/{}/information", pci_addr),
+            content: text.to_string(),
+        },
+        pci_addr,
+        minor: minor?,
+    })
+}
+
+pub fn read_host_gpu_info() -> Result<Vec<GpuInfo>, String> {
+    let gpu_root = std::path::Path::new("/proc/driver/nvidia/gpus");
+
+    let entries = std::fs::read_dir(gpu_root)
+        .map_err(|e| format!("cannot read {}: {}", gpu_root.display(), e))?;
+
+    let mut gpus: Vec<GpuInfo> = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("readdir error: {}", e))?;
+        let pci_addr = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "non-UTF8 PCI address directory".to_string())?;
+
+        let info_path = entry.path().join("information");
+        let text = std::fs::read_to_string(&info_path)
+            .map_err(|e| format!("cannot read {}: {}", info_path.display(), e))?;
+
+        match parse_gpu_information(&pci_addr, &text) {
+            Some(gpu) => {
+                log::info!(
+                    "virtio-gpu-nv: found host GPU {} minor={}",
+                    gpu.pci_addr,
+                    gpu.minor
+                );
+                gpus.push(gpu);
+            }
+            None => log::warn!(
+                "virtio-gpu-nv: skipping {}: missing Device Minor field",
+                info_path.display()
+            ),
+        }
+    }
+
+    gpus.sort_by(|a, b| a.pci_addr.cmp(&b.pci_addr));
+
+    if gpus.is_empty() {
+        return Err("no NVIDIA GPUs found in /proc/driver/nvidia/gpus".to_string());
+    }
+    if gpus.len() > 8 {
+        log::warn!("virtio-gpu-nv: found {} GPUs, clamping to 8", gpus.len());
+        gpus.truncate(8);
+    }
+
+    Ok(gpus)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Public configuration (set by krun_enable_nvidia before the VM starts)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -18,8 +157,13 @@ pub struct GpuNvConfig {
     pub num_gpus: u32,
     /// Capability bitmask (NVGPU_CAP_*).
     pub caps: u32,
-    /// Host driver version string, e.g. "535.129.03".
+    /// Host driver version string, e.g. "595.58.03".
     pub driver_version: String,
+    /// One entry per exposed GPU, in wire order.
+    pub gpus: Vec<GpuInfo>,
+    /// Any additional host proc files to recreate verbatim in the guest.
+    /// Extend this at the call site to pass through whatever.
+    pub extra_proc: Vec<HostProcFile>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -142,7 +286,7 @@ impl GpuNv {
 
         let caps = config.caps;
         // Build feature bits from config.caps
-        let mut avail_features = 0u64;
+        let mut avail_features = 1u64 << 32; // VIRTIO_F_VERSION_1
         if config.caps & NVGPU_CAP_COMPUTE != 0 {
             avail_features |= 1 << 0; // F_UVM
         }

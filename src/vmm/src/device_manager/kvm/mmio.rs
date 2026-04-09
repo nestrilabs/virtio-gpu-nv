@@ -74,8 +74,8 @@ type Result<T> = ::std::result::Result<T, Error>;
 /// This represents the size of the mmio device specified to the kernel as a cmdline option
 /// It has to be larger than 0x100 (the offset where the configuration space starts from
 /// the beginning of the memory mapped device registers) + the size of the configuration space
-/// Currently hardcoded to 4K.
-const MMIO_LEN: u64 = 0x1000;
+/// Bumped from 4K to 16K to accommodate large virtio config spaces
+const MMIO_LEN: u64 = 0x4000; // 16K
 
 /// Manages the complexities of registering a MMIO device.
 pub struct MMIODeviceManager {

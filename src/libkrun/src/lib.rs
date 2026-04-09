@@ -619,23 +619,54 @@ pub unsafe extern "C" fn krun_enable_nvgpu(
     let version = match DriverVersion::detect() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("krun_enable_nvidia: {}", e);
+            error!("krun_enable_nvgpu: {}", e);
+            return -libc::ENODEV;
+        }
+    };
+
+    // ── Read real GPU info from host procfs ───────────────────────────────
+    let host_gpus = match devices::virtio::gpu_nv::device::read_host_gpu_info() {
+        Ok(g) => g,
+        Err(e) => {
+            error!("krun_enable_nvgpu: {}", e);
             return -libc::ENODEV;
         }
     };
 
     // ── Parse GPU IDs ─────────────────────────────────────────────────────
-    let gpu_list: Vec<u32> = if gpu_ids.is_null() {
-        vec![0]
+    // IDs are minor numbers (0, 1, …).  null → expose every discovered GPU.
+    let requested_minors: Vec<u32> = if gpu_ids.is_null() {
+        host_gpus.iter().map(|g| g.minor).collect()
     } else {
-        let s = CStr::from_ptr(gpu_ids).to_str().unwrap_or("0");
+        let s = CStr::from_ptr(gpu_ids).to_str().unwrap_or("");
         s.split(',')
             .filter_map(|x| x.trim().parse::<u32>().ok())
             .collect()
     };
 
-    if gpu_list.is_empty() {
+    if requested_minors.is_empty() {
+        error!("krun_enable_nvgpu: no GPU minors requested");
         return -libc::EINVAL;
+    }
+
+    // Keep only the GPUs whose minor number was requested, in request order.
+    let selected_gpus: Vec<devices::virtio::gpu_nv::device::GpuInfo> = requested_minors
+        .iter()
+        .filter_map(|&minor| match host_gpus.iter().find(|g| g.minor == minor) {
+            Some(g) => Some(g.clone()),
+            None => {
+                error!(
+                    "krun_enable_nvgpu: no GPU with minor {} in host procfs",
+                    minor
+                );
+                None
+            }
+        })
+        .collect();
+
+    if selected_gpus.is_empty() {
+        error!("krun_enable_nvgpu: none of the requested GPU minors were found");
+        return -libc::ENODEV;
     }
 
     // ── Parse capabilities ────────────────────────────────────────────────
@@ -647,45 +678,32 @@ pub unsafe extern "C" fn krun_enable_nvgpu(
     };
 
     // ── Verify host device nodes are accessible ───────────────────────────
-    for &gpu_id in &gpu_list {
-        let path = format!("/dev/nvidia{}", gpu_id);
+    for gpu in &selected_gpus {
+        let path = format!("/dev/nvidia{}", gpu.minor);
         if !Path::new(&path).exists() {
-            eprintln!("krun_enable_nvidia: {} not found", path);
+            error!("krun_enable_nvgpu: {} not found", path);
             return -libc::ENODEV;
         }
     }
 
     if !Path::new("/dev/nvidiactl").exists() {
-        eprintln!("krun_enable_nvidia: /dev/nvidiactl not found");
+        error!("krun_enable_nvgpu: /dev/nvidiactl not found");
         return -libc::ENODEV;
     }
 
     // ── Store config in the context ───────────────────────────────────────
     let config = GpuNvConfig {
-        num_gpus: gpu_list.len() as u32,
+        num_gpus: selected_gpus.len() as u32,
         caps: caps_val,
         driver_version: version.as_string(),
+        gpus: selected_gpus,
+        extra_proc: devices::virtio::gpu_nv::device::read_host_nvidia_proc_tree(),
     };
 
-    // CTX_MAP is the existing global context map used by libkrun.
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => ctx_cfg.get_mut().vmr.set_nvgpu_config(config),
         Entry::Vacant(_) => return -libc::ENOENT,
     }
-
-    // TODO: Is this really needed? As we mount the host as /, so we get the full host nvidia files
-    // // ── Auto-discover NVIDIA libraries and add a virtio-fs share ─────────
-    // if let Ok(lib_path) = find_nvidia_libs() {
-    //     let path_str = match lib_path.to_str() {
-    //         Some(s) => s.to_string(),
-    //         None => return -libc::EINVAL,
-    //     };
-    //     // krun_add_virtiofs2 is the existing libkrun API.
-    //     // The "nvidia-libs" tag is the virtiofs mount tag the guest uses.
-    //     let tag = b"nvidia-libs\0";
-    //     let cpath = std::ffi::CString::new(path_str).unwrap();
-    //     crate::krun_add_virtiofs2(ctx_id, tag.as_ptr() as _, cpath.as_ptr());
-    // }
 
     KRUN_SUCCESS
 }

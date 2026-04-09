@@ -17,14 +17,14 @@
 use std::os::unix::io::AsRawFd;
 
 use kvm_bindings::kvm_userspace_memory_region;
-
 use crate::virtio::gpu_nv::device::GpuMapping;
+use crate::virtio::gpu_nv::worker::Worker;
 use crate::virtio::gpu_nv::{
-    bytes_of, GpuNv, NvgpuMmapReq, NvgpuMmapResp, NvgpuMsgHdr, NvgpuMunmapReq, NVGPU_MSG_MMAP,
+    bytes_of, NvgpuMmapReq, NvgpuMmapResp, NvgpuMsgHdr, NvgpuMunmapReq, NVGPU_MSG_MMAP,
     NVGPU_MSG_MUNMAP,
 };
 
-impl GpuNv {
+impl Worker {
     // ─────────────────────────────────────────────────────────────────────────
     // MMAP
     // ─────────────────────────────────────────────────────────────────────────

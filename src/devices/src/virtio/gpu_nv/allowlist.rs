@@ -10,13 +10,30 @@ use std::collections::HashSet;
 
 use crate::virtio::gpu_nv::{NVGPU_CAP_GRAPHICS, NVGPU_CAP_VIDEO};
 
+/// Ioctls whose payload contains a guest fd that must be translated to a
+/// host fd number before forwarding.  Add new entries here as they are
+/// discovered — no other code needs to change.
+///
+/// `payload_offset` is the byte offset within the ioctl data buffer where
+/// the 4-byte fd value lives.
+#[derive(Clone, Copy)]
+pub struct FdTranslationEntry {
+    pub nr:             u32,
+    pub payload_offset: usize,
+}
+
+/// All frontend ioctls that carry an embedded fd operand.
+pub const FD_TRANSLATION_IOCTLS: &[FdTranslationEntry] = &[
+    FdTranslationEntry { nr: 0xc9, payload_offset: 0 }, // NV_ESC_REGISTER_FD
+];
+
+#[derive(Clone)]
 pub struct AllowedIoctls {
     /// Allowed IOC_NR values for /dev/nvidia* and /dev/nvidiactl.
     frontend: HashSet<u32>,
     /// Allowed IOC_NR values for /dev/nvidia-uvm.
     uvm: HashSet<u32>,
 }
-
 impl AllowedIoctls {
     pub fn new(caps: u32) -> Self {
         let mut a = AllowedIoctls {
@@ -24,20 +41,26 @@ impl AllowedIoctls {
             uvm: HashSet::new(),
         };
 
+        const NV_IOCTL_BASE: u32 = 200;
+
         // ── Always-allowed frontend ioctls (compute + utility) ───────────────
         let base: &[u32] = &[
-            0x01, // NV_ESC_CARD_INFO (alternate nr seen on some versions)
-            0x27, // NV_ESC_RM_ALLOC_CONTEXT_DMA2
-            0x29, // NV_ESC_RM_FREE
-            0x2a, // NV_ESC_RM_CONTROL
-            0x2b, // NV_ESC_RM_ALLOC
-            0x2e, // NV_ESC_RM_MAP_MEMORY
-            0x2f, // NV_ESC_RM_UNMAP_MEMORY
-            0x34, // NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO
-            0x37, // NV_ESC_REGISTER_FD
-            0x4d, // NV_ESC_CARD_INFO
-            0x57, // NV_ESC_SYS_PARAMS
-            0x58, // NV_ESC_NUMA_INFO
+            0x01,               // NV_ESC_CARD_INFO (alternate nr seen on some versions)
+            0x54,               // NV_ESC_RM_ALLOC_CONTEXT_DMA2
+            0x29,               // NV_ESC_RM_FREE
+            0x2A,               // NV_ESC_RM_CONTROL
+            0x2B,               // NV_ESC_RM_ALLOC
+            0x4E,               // NV_ESC_RM_MAP_MEMORY
+            0x4F,               // NV_ESC_RM_UNMAP_MEMORY
+            0x5E,               // NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO
+            NV_IOCTL_BASE + 1,  // NV_ESC_REGISTER_FD
+            NV_IOCTL_BASE + 0,  // NV_ESC_CARD_INFO
+            NV_IOCTL_BASE + 14, // NV_ESC_SYS_PARAMS
+            0x58,               // NV_ESC_NUMA_INFO
+            0xc8,               // NV_ESC_QUERY_DEVICE_INTR
+            0xd2,               // NV_ESC_CHECK_VERSION_STR
+            0xd6,               // NV_ESC_WAIT_OPEN_COMPLETE
+            0xda,               // NV_ESC_ATTACH_GPUS_TO_FD
         ];
         for &nr in base {
             a.frontend.insert(nr);
@@ -46,16 +69,16 @@ impl AllowedIoctls {
         // ── Graphics capability ──────────────────────────────────────────────
         if caps & NVGPU_CAP_GRAPHICS != 0 {
             a.frontend.insert(0x27); // NV_ESC_RM_ALLOC_CONTEXT_DMA2
-            a.frontend.insert(0x30); // NV_ESC_RM_IDLE_CHANNELS
-            a.frontend.insert(0x31); // NV_ESC_RM_MAP_MEMORY_DMA
-            a.frontend.insert(0x32); // NV_ESC_RM_UNMAP_MEMORY_DMA
-            a.frontend.insert(0x35); // NV_ESC_RM_BIND_CONTEXT_DMA
+            a.frontend.insert(0x41); // NV_ESC_RM_IDLE_CHANNELS
+            a.frontend.insert(0x57); // NV_ESC_RM_MAP_MEMORY_DMA
+            a.frontend.insert(0x58); // NV_ESC_RM_UNMAP_MEMORY_DMA
+            a.frontend.insert(0x59); // NV_ESC_RM_BIND_CONTEXT_DMA
         }
 
         // ── Video capability (NVENC / NVDEC) ─────────────────────────────────
         if caps & NVGPU_CAP_VIDEO != 0 {
-            a.frontend.insert(0x31); // NV_ESC_RM_MAP_MEMORY_DMA
-            a.frontend.insert(0x32); // NV_ESC_RM_UNMAP_MEMORY_DMA
+            a.frontend.insert(0x57); // NV_ESC_RM_MAP_MEMORY_DMA
+            a.frontend.insert(0x58); // NV_ESC_RM_UNMAP_MEMORY_DMA
         }
 
         // ── UVM ioctls (all forwarded; UVM is an isolated device) ────────────
@@ -79,5 +102,10 @@ impl AllowedIoctls {
     pub fn is_uvm_allowed(&self, cmd: u32) -> bool {
         let nr = cmd & 0xFF;
         self.uvm.contains(&nr)
+    }
+
+    /// If `nr` is an fd-carrying ioctl, return its translation entry.
+    pub fn fd_translation(nr: u32) -> Option<&'static FdTranslationEntry> {
+        FD_TRANSLATION_IOCTLS.iter().find(|e| e.nr == nr)
     }
 }
