@@ -1311,10 +1311,10 @@ static const struct file_operations nvgpu_dri_fops = {
     .mmap = nvgpu_mmap,
 };
 
-static char *nvgpu_devnode(const struct device *dev, umode_t *mode) {
+static char *nvgpu_dri_devnode(const struct device *dev, umode_t *mode) {
   if (mode)
     *mode = 0666;
-  return NULL;
+  return kasprintf(GFP_KERNEL, "dri/%s", dev_name(dev));
 }
 
 static int nvgpu_dri_init(struct nvgpu_device *dev) {
@@ -1339,7 +1339,7 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
   } else {
     /* We created it — we own it, must destroy on remove */
     nvgpu_drm_class = drm_cls;
-    nvgpu_drm_class->devnode = nvgpu_devnode;
+    nvgpu_drm_class->devnode = nvgpu_dri_devnode;
     dev_info(&dev->vdev->dev, "virtio-gpu-nv: created drm class\n");
   }
 
