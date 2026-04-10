@@ -13,6 +13,7 @@
 
 #include <linux/cdev.h>
 #include <linux/completion.h>
+#include <linux/cpu.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
@@ -1306,6 +1307,12 @@ static const struct file_operations nvgpu_dri_fops = {
     .mmap = nvgpu_mmap,
 };
 
+static char *nvgpu_devnode(const struct device *dev, umode_t *mode) {
+  if (mode)
+    *mode = 0666;
+  return NULL;
+}
+
 static int nvgpu_dri_init(struct nvgpu_device *dev) {
   int i;
 
@@ -1505,12 +1512,6 @@ out:
   kvfree(resp_buf);
   kfree(req);
   return ret;
-}
-
-static char *nvgpu_devnode(const struct device *dev, umode_t *mode) {
-  if (mode)
-    *mode = 0666;
-  return NULL;
 }
 
 /* ───────── Probe / remove ───────── */
