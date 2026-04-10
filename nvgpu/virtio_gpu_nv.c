@@ -1311,6 +1311,12 @@ static const struct file_operations nvgpu_dri_fops = {
     .mmap = nvgpu_mmap,
 };
 
+static char *nvgpu_devnode(const struct device *dev, umode_t *mode) {
+  if (mode)
+    *mode = 0666;
+  return NULL;
+}
+
 static char *nvgpu_dri_devnode(const struct device *dev, umode_t *mode) {
   if (mode)
     *mode = 0666;
