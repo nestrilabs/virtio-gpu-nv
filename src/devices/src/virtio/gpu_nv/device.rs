@@ -26,6 +26,120 @@ pub struct DriDevice {
     pub minor: u32,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Host /sys/module/nvidia* passthrough
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SYS_MODULE_PATHS: &[&str] = &[
+    "/sys/module/nvidia/initstate",
+    "/sys/module/nvidia_uvm/initstate",
+];
+
+pub fn read_host_module_sys_files() -> Vec<SysFile> {
+    let mut files = Vec::new();
+    for &abs_path in SYS_MODULE_PATHS {
+        match std::fs::read(abs_path) {
+            Ok(content) => {
+                let rel = abs_path.strip_prefix("/sys/").unwrap_or(abs_path);
+                log::debug!("virtio-gpu-nv: captured sys {}", rel);
+                files.push(SysFile {
+                    path: rel.to_string(),
+                    content,
+                });
+            }
+            Err(e) => log::debug!("virtio-gpu-nv: skipping {}: {}", abs_path, e),
+        }
+    }
+    log::info!("virtio-gpu-nv: captured {} module sys files", files.len());
+    files
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Host /sys/bus/pci/devices/<addr>/ passthrough
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn walk_sysfs_tree(dir: &std::path::Path, prefix: &str, files: &mut Vec<SysFile>, max_size: u64) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        // Skip binary MMIO resource windows (resource0, resource1, …)
+        // but keep the text "resource" file that lists all windows.
+        if name.starts_with("resource") && name != "resource" {
+            continue;
+        }
+        // Skip VBIOS rom (can be large)
+        if name == "rom" {
+            continue;
+        }
+
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        // Skip symlinks (driver, subsystem, iommu, etc.)
+        if meta.is_symlink() {
+            continue;
+        }
+
+        if meta.is_dir() {
+            // Skip directories that add no value for NVML / vulkan
+            if name == "power"
+                || name == "msi_irqs"
+                || name.starts_with("virtfn")
+                || name == "iommu"
+                || name == "ptm"
+                || name == "accel"
+            {
+                continue;
+            }
+            let sub_prefix = format!("{}/{}", prefix, name);
+            walk_sysfs_tree(&path, &sub_prefix, files, max_size);
+            continue;
+        }
+
+        if !meta.is_file() {
+            continue;
+        }
+
+        if meta.len() > max_size {
+            continue;
+        }
+
+        match std::fs::read(&path) {
+            Ok(content) => {
+                let rel = format!("{}/{}", prefix, name);
+                log::debug!("virtio-gpu-nv: captured PCI sys {}", rel);
+                files.push(SysFile { path: rel, content });
+            }
+            Err(e) => log::debug!("virtio-gpu-nv: skipping {}: {}", path.display(), e),
+        }
+    }
+}
+
+/// Read all readable sysfs files under /sys/bus/pci/devices/<addr>/
+/// for each passed-through GPU.
+pub fn read_host_pci_sysfs(gpu_pci_addrs: &[String]) -> Vec<SysFile> {
+    let mut files = Vec::new();
+    for addr in gpu_pci_addrs {
+        let pci_dir = std::path::Path::new("/sys/bus/pci/devices").join(addr);
+        if !pci_dir.exists() {
+            log::debug!("virtio-gpu-nv: PCI dir {} not found", pci_dir.display());
+            continue;
+        }
+        let prefix = format!("bus/pci/devices/{}", addr);
+        walk_sysfs_tree(&pci_dir, &prefix, &mut files, 4096);
+    }
+    log::info!("virtio-gpu-nv: captured {} PCI sys files", files.len());
+    files
+}
+
 /// Sysfs paths under /sys/devices/system/node/node0/ that NVML reads.
 const NUMA_SYS_PATHS: &[&str] = &[
     "/sys/devices/system/node/node0/cpumap",

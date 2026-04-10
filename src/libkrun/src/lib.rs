@@ -694,14 +694,21 @@ pub unsafe extern "C" fn krun_enable_nvgpu(
     // ── Extract PCI addresses from selected GPUs ──────────────────────────────
     let gpu_pci_addrs: Vec<String> = selected_gpus.iter().map(|g| g.pci_addr.clone()).collect();
 
+    let mut sys_files = Vec::new();
+    sys_files.extend(devices::virtio::gpu_nv::device::read_host_sys_files()); // NUMA node
+    sys_files.extend(devices::virtio::gpu_nv::device::read_host_module_sys_files()); // module initstate
+    sys_files.extend(devices::virtio::gpu_nv::device::read_host_pci_sysfs(
+        &gpu_pci_addrs,
+    ));
+
     // ── Store config in the context ───────────────────────────────────────
     let config = GpuNvConfig {
-        num_gpus: selected_gpus.len() as u32,
+        sys_files,
         caps: caps_val,
-        driver_version: version.as_string(),
+        num_gpus: selected_gpus.len() as u32,
         gpus: selected_gpus,
+        driver_version: version.as_string(),
         extra_proc: devices::virtio::gpu_nv::device::read_host_nvidia_proc_tree(),
-        sys_files: devices::virtio::gpu_nv::device::read_host_sys_files(),
         dri_devices: devices::virtio::gpu_nv::device::find_dri_devices(&gpu_pci_addrs),
     };
 
