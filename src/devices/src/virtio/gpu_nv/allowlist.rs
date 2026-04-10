@@ -90,7 +90,7 @@ impl AllowedIoctls {
         // UVM numbers 0x00-0x3f; list the most common ones explicitly.
         // In practice we allow all UVM ioctls since UVM does its own
         // per-client isolation and has a different security model.
-        for nr in 0x00u32..=0x3fu32 {
+        for nr in 0x00u32..=0x4fu32 {
             a.uvm.insert(nr);
         }
 
