@@ -10,7 +10,7 @@
  * Guest kernel driver — runs inside the VM.
  * Place in: drivers/virtio/virtio_gpu_nv.c (libkrunfw tree)
  */
-
+#include <drm/drm_drv.h>
 #include <linux/cdev.h>
 #include <linux/completion.h>
 #include <linux/cpu.h>
@@ -988,7 +988,7 @@ static void nvgpu_dir_cache_reset(void) {
   nvgpu_dir_cache_count = 0;
 }
 
-static struct proc_dir_entry *static struct proc_dir_entry *
+static struct proc_dir_entry *
 nvgpu_proc_mkdir_cached(const char *path, struct proc_dir_entry *parent) {
   int i;
   struct proc_dir_entry *entry;
@@ -1000,11 +1000,9 @@ nvgpu_proc_mkdir_cached(const char *path, struct proc_dir_entry *parent) {
 
   /*
    * "driver" already exists in procfs — don't try to recreate it.
-   * Add other known-existing dirs here if the VMM sends more paths
-   * that collide with built-in proc entries.
    */
   if (parent == NULL && strcmp(path, "driver") == 0)
-    entry = NULL; /* proc_create_data with NULL parent+leaf works */
+    entry = NULL;
   else
     entry = proc_mkdir(path, parent);
 
@@ -1321,17 +1319,29 @@ static char *nvgpu_devnode(const struct device *dev, umode_t *mode) {
 
 static int nvgpu_dri_init(struct nvgpu_device *dev) {
   int i;
+  struct class *drm_cls;
 
   if (dev->num_dri_devs == 0)
     return 0;
 
   /*
-   * Never create the drm class ourselves — DRM core owns it.
-   * If it already exists we can use it; if not, we register
-   * the cdevs anyway (they work without a /sys/class entry).
-   * We do NOT call class_create("drm") at all.
+   * drm_virtio never ran (no standard virtio-gpu device exposed by VMM),
+   * so /sys/class/drm was never created. We need it for udev to create
+   * /dev/dri/ nodes. Create it here if absent; if DRM core already made
+   * it, class_create returns ERR_PTR(-EEXIST) and we just move on without
+   * owning it.
    */
-  nvgpu_drm_class = NULL; /* we never own it */
+  drm_cls = class_create("drm");
+  if (IS_ERR(drm_cls)) {
+    /* Already exists — DRM core owns it, we don't */
+    nvgpu_drm_class = NULL;
+    dev_info(&dev->vdev->dev, "virtio-gpu-nv: drm class already exists\n");
+  } else {
+    /* We created it — we own it, must destroy on remove */
+    nvgpu_drm_class = drm_cls;
+    nvgpu_drm_class->devnode = nvgpu_devnode;
+    dev_info(&dev->vdev->dev, "virtio-gpu-nv: created drm class\n");
+  }
 
   for (i = 0; i < dev->num_dri_devs; i++) {
     dev_t devno = MKDEV(dev->dri_devs[i].major, dev->dri_devs[i].minor);
@@ -1353,6 +1363,25 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
       continue;
     }
 
+    /*
+     * Only call device_create if we own the class OR if the class
+     * exists (borrowed). Either way udev needs the uevent.
+     */
+    {
+      struct class *cls = nvgpu_drm_class;
+      if (!cls) {
+        /*
+         * We don't own it but it exists — look it up.
+         * On 6.19 there's no exported class_find, so we
+         * just skip device_create and rely on the cdev
+         * being present. udev will find it via /sys/dev.
+         */
+      } else {
+        device_create(cls, &dev->vdev->dev, devno, dev, "%s",
+                      dev->dri_devs[i].name);
+      }
+    }
+
     dev->dri_devs[i].registered = true;
     dev_info(&dev->vdev->dev, "virtio-gpu-nv: registered /dev/dri/%s (%u:%u)\n",
              dev->dri_devs[i].name, dev->dri_devs[i].major,
@@ -1369,15 +1398,21 @@ static void nvgpu_dri_cleanup(struct nvgpu_device *dev) {
     if (!dev->dri_devs[i].registered)
       continue;
 
-    /* Never call device_destroy — we never called device_create */
+    if (nvgpu_drm_class)
+      device_destroy(nvgpu_drm_class,
+                     MKDEV(dev->dri_devs[i].major, dev->dri_devs[i].minor));
+
     cdev_del(&dev->dri_devs[i].cdev);
     unregister_chrdev_region(
         MKDEV(dev->dri_devs[i].major, dev->dri_devs[i].minor), 1);
     dev->dri_devs[i].registered = false;
   }
 
-  /* nvgpu_drm_class is always NULL — we never owned it */
-  nvgpu_drm_class = NULL;
+  /* Only destroy class if WE created it */
+  if (nvgpu_drm_class) {
+    class_destroy(nvgpu_drm_class);
+    nvgpu_drm_class = NULL;
+  }
 }
 
 /* ───────── GET_SYS_FILES handler (guest side) ──────────────────────────── */
