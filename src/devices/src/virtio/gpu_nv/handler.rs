@@ -77,6 +77,14 @@ impl Worker {
             256 => "/dev/nvidia-uvm".to_string(),
             257 => "/dev/nvidia-uvm-tools".to_string(),
             258 => "/dev/nvidia-modeset".to_string(),
+            512.. => {
+                // DRI device — index into config.dri_devices
+                let idx = (req.device_type - 512) as usize;
+                match self.config.dri_devices.get(idx) {
+                    Some(dri) => format!("/dev/dri/{}", dri.name),
+                    None => return self.error_response(0, -libc::ENODEV),
+                }
+            }
             _ => return self.error_response(0, -libc::EINVAL),
         };
 
@@ -96,11 +104,18 @@ impl Worker {
         let handle = self.next_handle;
         self.next_handle += 1;
 
+        log::error!(
+            "virtio-gpu-nv: OPEN handle={} device_type={} path={}",
+            handle,
+            device_type,
+            path
+        );
+
         self.fd_table.insert(
             handle,
             HostFd {
                 fd: file,
-                device_type: req.device_type,
+                device_type,
                 mapping_ids: Vec::new(),
             },
         );
@@ -280,6 +295,16 @@ impl Worker {
 
         let errno = if ret < 0 { errno_val() } else { 0 };
 
+        let nr = ioc_nr(req.cmd);
+        if nr == 0xd7 || nr == 0xd6 {
+            log::error!(
+                "virtio-gpu-nv: nr=0x{:02x} ret={} errno={} first16={:02x?}",
+                nr,
+                ret,
+                errno,
+                &buf[..buf.len().min(16)]
+            );
+        }
         if std::env::var("NVGPU_LOG_IOCTLS").is_ok() && ioc_nr(req.cmd) == 0xc9 {
             log::error!(
                 "virtio-gpu-nv: CARD_INFO/REGISTER_FD nr=0xc9 \
@@ -348,6 +373,7 @@ impl Worker {
         // Both structs have the pointer at byte offset 16 (after 4×u32 fields).
         const PTR_OFFSET: usize = 16;
         const PTR_SIZE: usize = 8;
+        const RIGHTS_OFFSET: usize = 24; // pRightsRequested in NVOS64 only
 
         if top.len() < PTR_OFFSET + PTR_SIZE {
             return self.error_response(req.hdr.handle, -libc::EINVAL);
@@ -363,6 +389,17 @@ impl Worker {
             nested_buf.as_mut_ptr() as u64
         };
         top[PTR_OFFSET..PTR_OFFSET + PTR_SIZE].copy_from_slice(&host_ptr_val.to_ne_bytes());
+
+        // After patching pAllocParms/params pointer, also zero pRightsRequested
+        // for RM_ALLOC (NVOS64). For RM_CONTROL (NVOS54) offset 24 is paramsSize
+        // which must not be zeroed — distinguish by ioc_nr.
+        if ioc_nr(req.cmd) == NV_ESC_RM_ALLOC {
+            if top.len() >= RIGHTS_OFFSET + PTR_SIZE {
+                // pRightsRequested — null it out; we never pass access masks
+                top[RIGHTS_OFFSET..RIGHTS_OFFSET + PTR_SIZE]
+                    .copy_from_slice(&0u64.to_le_bytes());
+            }
+        }
 
         let ret = unsafe {
             libc::ioctl(
@@ -452,12 +489,15 @@ impl Worker {
         payload.extend_from_slice(&0u32.to_le_bytes());
 
         // ── Section 2: DRI device nodes ──────────────────────────────────────
+        // Per-device wire format:
+        //   [name_len:u32][major:u32][minor:u32][gpu_id:u32][name bytes]
         payload.extend_from_slice(&(self.config.dri_devices.len() as u32).to_le_bytes());
         for dev in &self.config.dri_devices {
             let name = dev.name.as_bytes();
             payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
             payload.extend_from_slice(&dev.major.to_le_bytes());
             payload.extend_from_slice(&dev.minor.to_le_bytes());
+            payload.extend_from_slice(&dev.gpu_id.to_le_bytes());
             payload.extend_from_slice(name);
         }
 

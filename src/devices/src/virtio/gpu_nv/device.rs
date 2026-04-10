@@ -24,6 +24,8 @@ pub struct DriDevice {
     pub name: String,
     pub major: u32,
     pub minor: u32,
+    /// NVIDIA GPU ID
+    pub gpu_id: u32,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -140,33 +142,65 @@ pub fn read_host_pci_sysfs(gpu_pci_addrs: &[String]) -> Vec<SysFile> {
     files
 }
 
-/// Sysfs paths under /sys/devices/system/node/node0/ that NVML reads.
-const NUMA_SYS_PATHS: &[&str] = &[
-    "/sys/devices/system/node/node0/cpumap",
-    "/sys/devices/system/node/node0/cpulist",
-    "/sys/devices/system/node/node0/numastat",
-    "/sys/devices/system/node/node0/meminfo",
-    "/sys/devices/system/node/node0/hugepages",
-];
-
-/// Read NUMA sysfs files from the host.  Only returns files that exist.
-pub fn read_host_sys_files() -> Vec<SysFile> {
+pub fn read_host_sys_files(gpu_pci_addrs: &[String]) -> Vec<SysFile> {
     let mut files = Vec::new();
-    for &abs_path in NUMA_SYS_PATHS {
-        match std::fs::read(abs_path) {
-            Ok(content) => {
-                let rel = abs_path.strip_prefix("/sys/").unwrap_or(abs_path);
-                log::debug!("virtio-gpu-nv: captured sys {}", rel);
-                files.push(SysFile {
-                    path: rel.to_string(),
-                    content,
-                });
+
+    // ── PCI sysfs files — one set per GPU ────────────────────────────────────
+    for pci_addr in gpu_pci_addrs {
+        let pci_base = std::path::Path::new("/sys/bus/pci/devices").join(pci_addr);
+
+        match std::fs::read_dir(&pci_base) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let meta = match std::fs::metadata(&path) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if !meta.is_file() {
+                        continue;
+                    }
+                    match std::fs::read(&path) {
+                        Ok(content) => {
+                            let rel = path
+                                .strip_prefix("/sys/")
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                                .to_string();
+                            log::debug!("virtio-gpu-nv: captured pci sysfs {}", rel);
+                            files.push(SysFile { path: rel, content });
+                        }
+                        Err(e) => log::debug!("virtio-gpu-nv: skipping {}: {}", path.display(), e),
+                    }
+                }
             }
-            Err(e) => log::debug!("virtio-gpu-nv: skipping {}: {}", abs_path, e),
+            Err(e) => log::warn!("virtio-gpu-nv: cannot read {}: {}", pci_base.display(), e),
         }
     }
+
     log::info!("virtio-gpu-nv: captured {} host sys files", files.len());
     files
+}
+
+/// Parse "GPU ID: 0x1234abcd" from an nvidia information file.
+/// Returns 0 on failure — callers should treat 0 as unknown, not fatal.
+fn parse_gpu_id_from_information(text: &str) -> u32 {
+    for line in text.lines() {
+        // Line looks like:  "GPU ID:                  0x12345678"
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("GPU ID:") {
+            let val = rest.trim();
+            // May be hex ("0x...") or decimal
+            if let Some(hex) = val.strip_prefix("0x").or_else(|| val.strip_prefix("0X")) {
+                if let Ok(v) = u32::from_str_radix(hex, 16) {
+                    return v;
+                }
+            } else if let Ok(v) = val.parse::<u32>() {
+                return v;
+            }
+        }
+    }
+    0
 }
 
 /// Find DRI device nodes that belong to `gpu_pci_addrs`.
@@ -174,6 +208,7 @@ pub fn read_host_sys_files() -> Vec<SysFile> {
 /// For each entry in /sys/class/drm/ the `device` symlink is resolved and
 /// the last path component (the PCI address) is compared against our list.
 /// The device major:minor is read from the adjacent `dev` file.
+/// The gpu_id is read from /proc/driver/nvidia/gpus/<pci_addr>/information.
 pub fn find_dri_devices(gpu_pci_addrs: &[String]) -> Vec<DriDevice> {
     let drm_class = std::path::Path::new("/sys/class/drm");
     let mut devices = Vec::new();
@@ -189,13 +224,12 @@ pub fn find_dri_devices(gpu_pci_addrs: &[String]) -> Vec<DriDevice> {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // Only interested in card* and renderD* nodes, not connectors / ports.
+        // Only card* and renderD* — not connectors / ports.
         if !name.starts_with("card") && !name.starts_with("renderD") {
             continue;
         }
 
         // Resolve /sys/class/drm/<name>/device → real PCI device path.
-        // Last component of the target is the PCI address string.
         let device_link = entry.path().join("device");
         let target = match std::fs::read_link(&device_link) {
             Ok(t) => t,
@@ -229,14 +263,38 @@ pub fn find_dri_devices(gpu_pci_addrs: &[String]) -> Vec<DriDevice> {
             continue;
         }
 
+        // Read gpu_id from /proc/driver/nvidia/gpus/<pci_addr>/information.
+        // Non-fatal — gpu_id=0 means the stub will return 0 for GET_DEV_INFO,
+        // which is still better than failing the open.
+        let gpu_id = {
+            let info_path = format!("/proc/driver/nvidia/gpus/{}/information", pci_addr);
+            match std::fs::read_to_string(&info_path) {
+                Ok(text) => parse_gpu_id_from_information(&text),
+                Err(e) => {
+                    log::warn!(
+                        "virtio-gpu-nv: cannot read {}: {} — gpu_id will be 0",
+                        info_path,
+                        e
+                    );
+                    0
+                }
+            }
+        };
+
         log::info!(
-            "virtio-gpu-nv: found DRI device {} ({}:{}) for GPU {}",
+            "virtio-gpu-nv: found DRI device {} ({}:{}) gpu_id=0x{:x} for GPU {}",
             name,
             major,
             minor,
+            gpu_id,
             pci_addr
         );
-        devices.push(DriDevice { name, major, minor });
+        devices.push(DriDevice {
+            name,
+            major,
+            minor,
+            gpu_id,
+        });
     }
 
     // Stable order: card* before renderD*, then by minor.
