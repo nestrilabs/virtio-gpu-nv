@@ -18,13 +18,16 @@ use crate::virtio::gpu_nv::{NVGPU_CAP_GRAPHICS, NVGPU_CAP_VIDEO};
 /// the 4-byte fd value lives.
 #[derive(Clone, Copy)]
 pub struct FdTranslationEntry {
-    pub nr:             u32,
+    pub nr: u32,
     pub payload_offset: usize,
 }
 
 /// All frontend ioctls that carry an embedded fd operand.
 pub const FD_TRANSLATION_IOCTLS: &[FdTranslationEntry] = &[
-    FdTranslationEntry { nr: 0xc9, payload_offset: 0 }, // NV_ESC_REGISTER_FD
+    FdTranslationEntry {
+        nr: 0xc9,
+        payload_offset: 0,
+    }, // NV_ESC_REGISTER_FD
 ];
 
 #[derive(Clone)]
@@ -60,6 +63,7 @@ impl AllowedIoctls {
             0xc8,               // NV_ESC_QUERY_DEVICE_INTR
             0xd2,               // NV_ESC_CHECK_VERSION_STR
             0xd6,               // NV_ESC_WAIT_OPEN_COMPLETE
+            0xd7,               // NV_ESC_SYS_PARAMS ??? (driver 535+)
             0xda,               // NV_ESC_ATTACH_GPUS_TO_FD
         ];
         for &nr in base {
