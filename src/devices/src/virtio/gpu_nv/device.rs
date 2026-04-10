@@ -8,6 +8,133 @@ use std::sync::Arc;
 
 use crate::virtio::gpu_nv::allowlist::AllowedIoctls;
 
+/// One host sysfs file to be recreated verbatim in the guest.
+#[derive(Debug, Clone)]
+pub struct SysFile {
+    /// Path relative to /sys/ — e.g. "devices/system/node/node0/cpumap"
+    pub path: String,
+    /// Raw file content.
+    pub content: Vec<u8>,
+}
+
+/// A DRI device node on the host that belongs to one of our passed-through GPUs.
+#[derive(Debug, Clone)]
+pub struct DriDevice {
+    /// Device node name — "renderD128" or "card1" etc.
+    pub name: String,
+    pub major: u32,
+    pub minor: u32,
+}
+
+/// Sysfs paths under /sys/devices/system/node/node0/ that NVML reads.
+const NUMA_SYS_PATHS: &[&str] = &[
+    "/sys/devices/system/node/node0/cpumap",
+    "/sys/devices/system/node/node0/cpulist",
+    "/sys/devices/system/node/node0/numastat",
+    "/sys/devices/system/node/node0/meminfo",
+    "/sys/devices/system/node/node0/hugepages",
+];
+
+/// Read NUMA sysfs files from the host.  Only returns files that exist.
+pub fn read_host_sys_files() -> Vec<SysFile> {
+    let mut files = Vec::new();
+    for &abs_path in NUMA_SYS_PATHS {
+        match std::fs::read(abs_path) {
+            Ok(content) => {
+                let rel = abs_path.strip_prefix("/sys/").unwrap_or(abs_path);
+                log::debug!("virtio-gpu-nv: captured sys {}", rel);
+                files.push(SysFile {
+                    path: rel.to_string(),
+                    content,
+                });
+            }
+            Err(e) => log::debug!("virtio-gpu-nv: skipping {}: {}", abs_path, e),
+        }
+    }
+    log::info!("virtio-gpu-nv: captured {} host sys files", files.len());
+    files
+}
+
+/// Find DRI device nodes that belong to `gpu_pci_addrs`.
+///
+/// For each entry in /sys/class/drm/ the `device` symlink is resolved and
+/// the last path component (the PCI address) is compared against our list.
+/// The device major:minor is read from the adjacent `dev` file.
+pub fn find_dri_devices(gpu_pci_addrs: &[String]) -> Vec<DriDevice> {
+    let drm_class = std::path::Path::new("/sys/class/drm");
+    let mut devices = Vec::new();
+
+    let entries = match std::fs::read_dir(drm_class) {
+        Ok(e) => e,
+        Err(e) => {
+            log::warn!("virtio-gpu-nv: cannot read /sys/class/drm: {}", e);
+            return devices;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        // Only interested in card* and renderD* nodes, not connectors / ports.
+        if !name.starts_with("card") && !name.starts_with("renderD") {
+            continue;
+        }
+
+        // Resolve /sys/class/drm/<name>/device → real PCI device path.
+        // Last component of the target is the PCI address string.
+        let device_link = entry.path().join("device");
+        let target = match std::fs::read_link(&device_link) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        let pci_addr = match target.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => continue,
+        };
+
+        if !gpu_pci_addrs.iter().any(|a| *a == pci_addr) {
+            continue;
+        }
+
+        // /sys/class/drm/<name>/dev contains "major:minor\n"
+        let dev_file = entry.path().join("dev");
+        let dev_str = match std::fs::read_to_string(&dev_file) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let parts: Vec<&str> = dev_str.trim().split(':').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+
+        let major: u32 = parts[0].parse().unwrap_or(0);
+        let minor: u32 = parts[1].parse().unwrap_or(0);
+        if major == 0 {
+            continue;
+        }
+
+        log::info!(
+            "virtio-gpu-nv: found DRI device {} ({}:{}) for GPU {}",
+            name,
+            major,
+            minor,
+            pci_addr
+        );
+        devices.push(DriDevice { name, major, minor });
+    }
+
+    // Stable order: card* before renderD*, then by minor.
+    devices.sort_by(|a, b| {
+        let ak = if a.name.starts_with("card") { 0 } else { 1 };
+        let bk = if b.name.starts_with("card") { 0 } else { 1 };
+        ak.cmp(&bk).then(a.minor.cmp(&b.minor))
+    });
+
+    devices
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Generic host→guest proc file passthrough
 // ─────────────────────────────────────────────────────────────────────────────
@@ -33,7 +160,10 @@ pub fn read_host_nvidia_proc_tree() -> Vec<HostProcFile> {
 fn walk_proc_dir(dir: &std::path::Path, out: &mut Vec<HostProcFile>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) => { log::warn!("virtio-gpu-nv: cannot read {}: {}", dir.display(), e); return; }
+        Err(e) => {
+            log::warn!("virtio-gpu-nv: cannot read {}: {}", dir.display(), e);
+            return;
+        }
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -45,7 +175,9 @@ fn walk_proc_dir(dir: &std::path::Path, out: &mut Vec<HostProcFile>) {
             walk_proc_dir(&path, out);
             continue;
         }
-        if !meta.is_file() { continue; }
+        if !meta.is_file() {
+            continue;
+        }
         let relative = match path.strip_prefix("/proc/") {
             Ok(r) => r.to_string_lossy().to_string(),
             Err(_) => continue,
@@ -53,7 +185,10 @@ fn walk_proc_dir(dir: &std::path::Path, out: &mut Vec<HostProcFile>) {
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 log::debug!("virtio-gpu-nv: captured {}", relative);
-                out.push(HostProcFile { guest_path: relative, content });
+                out.push(HostProcFile {
+                    guest_path: relative,
+                    content,
+                });
             }
             Err(e) => log::debug!("virtio-gpu-nv: skipping {}: {}", relative, e),
         }
@@ -164,6 +299,10 @@ pub struct GpuNvConfig {
     /// Any additional host proc files to recreate verbatim in the guest.
     /// Extend this at the call site to pass through whatever.
     pub extra_proc: Vec<HostProcFile>,
+    /// Host sysfs files to recreate in the guest (NUMA node, etc.).
+    pub sys_files: Vec<SysFile>,
+    /// DRI device nodes that belong to the passed-through GPU(s).
+    pub dri_devices: Vec<DriDevice>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -267,6 +406,7 @@ pub struct GpuNv {
     pub(crate) allowed_ioctls: AllowedIoctls,
 
     // ── virtio bookkeeping (filled in during activate) ──
+    #[allow(unused)]
     pub(crate) queues: Vec<crate::virtio::DeviceQueue>,
     pub(crate) interrupt_transport: Option<crate::virtio::InterruptTransport>,
     pub(crate) guest_memory: Option<vm_memory::GuestMemoryMmap>,

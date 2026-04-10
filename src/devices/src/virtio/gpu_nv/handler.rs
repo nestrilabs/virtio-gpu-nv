@@ -6,7 +6,11 @@
 use crate::virtio::gpu_nv::allowlist::AllowedIoctls;
 use crate::virtio::gpu_nv::device::HostFd;
 use crate::virtio::gpu_nv::worker::Worker;
-use crate::virtio::gpu_nv::{bytes_of, ioc_nr, NvgpuIoctlReq, NvgpuIoctlResp, NvgpuMsgHdr, NvgpuOpenReq, NvgpuOpenResp, NVGPU_MSG_CLOSE, NVGPU_MSG_GET_PROC_FILES, NVGPU_MSG_IOCTL, NVGPU_MSG_MMAP, NVGPU_MSG_MUNMAP, NVGPU_MSG_OPEN};
+use crate::virtio::gpu_nv::{
+    bytes_of, ioc_nr, NvgpuIoctlReq, NvgpuIoctlResp, NvgpuMsgHdr, NvgpuOpenReq, NvgpuOpenResp,
+    NVGPU_MSG_CLOSE, NVGPU_MSG_GET_PROC_FILES, NVGPU_MSG_GET_SYS_FILES, NVGPU_MSG_IOCTL,
+    NVGPU_MSG_MMAP, NVGPU_MSG_MUNMAP, NVGPU_MSG_OPEN,
+};
 use std::os::unix::io::AsRawFd;
 
 /// NVIDIA ioctl numbers that carry embedded pointers.
@@ -47,6 +51,7 @@ impl Worker {
             NVGPU_MSG_MMAP => self.handle_mmap(req_buf),
             NVGPU_MSG_MUNMAP => self.handle_munmap(req_buf),
             NVGPU_MSG_GET_PROC_FILES => self.handle_get_proc_files(),
+            NVGPU_MSG_GET_SYS_FILES => self.handle_get_sys_files(),
             _ => self.error_response(hdr.handle, -libc::ENOSYS),
         }
     }
@@ -397,9 +402,9 @@ impl Worker {
         let mut payload: Vec<u8> = Vec::new();
 
         for f in &self.config.extra_proc {
-            let path    = f.guest_path.as_bytes();
+            let path = f.guest_path.as_bytes();
             let content = f.content.as_bytes();
-            payload.extend_from_slice(&(path.len()    as u32).to_le_bytes());
+            payload.extend_from_slice(&(path.len() as u32).to_le_bytes());
             payload.extend_from_slice(&(content.len() as u32).to_le_bytes());
             payload.extend_from_slice(path);
             payload.extend_from_slice(content);
@@ -410,9 +415,59 @@ impl Worker {
         payload.extend_from_slice(&0u32.to_le_bytes());
 
         log::debug!(
-        "virtio-gpu-nv: GET_PROC_FILES {} files {} bytes",
-        self.config.extra_proc.len(), payload.len()
-    );
+            "virtio-gpu-nv: GET_PROC_FILES {} files {} bytes",
+            self.config.extra_proc.len(),
+            payload.len()
+        );
+        payload
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // GET_SYS_FILES — send host sysfs content + DRI device list to guest
+    //
+    // Response format:
+    //   Section 1 — sysfs files (same streaming format as GET_PROC_FILES):
+    //     [path_len:u32][content_len:u32][path bytes][content bytes] ...
+    //     terminated by [0u32][0u32]
+    //
+    //   Section 2 — DRI devices:
+    //     [num_dri:u32]
+    //     per device: [name_len:u32][major:u32][minor:u32][name bytes]
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn handle_get_sys_files(&self) -> Vec<u8> {
+        let mut payload: Vec<u8> = Vec::new();
+
+        // ── Section 1: sysfs files ───────────────────────────────────────────
+        for f in &self.config.sys_files {
+            let path = f.path.as_bytes();
+            let content = &f.content;
+            payload.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            payload.extend_from_slice(&(content.len() as u32).to_le_bytes());
+            payload.extend_from_slice(path);
+            payload.extend_from_slice(content);
+        }
+        // Terminator
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+
+        // ── Section 2: DRI device nodes ──────────────────────────────────────
+        payload.extend_from_slice(&(self.config.dri_devices.len() as u32).to_le_bytes());
+        for dev in &self.config.dri_devices {
+            let name = dev.name.as_bytes();
+            payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            payload.extend_from_slice(&dev.major.to_le_bytes());
+            payload.extend_from_slice(&dev.minor.to_le_bytes());
+            payload.extend_from_slice(name);
+        }
+
+        log::debug!(
+            "virtio-gpu-nv: GET_SYS_FILES {} sys files, {} DRI devices, {} bytes",
+            self.config.sys_files.len(),
+            self.config.dri_devices.len(),
+            payload.len()
+        );
+
         payload
     }
 

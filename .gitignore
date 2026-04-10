@@ -1,0 +1,14 @@
+**__pycache__
+***.pyc
+***~
+**libkrunfw.so*
+**kernel.c
+**vmlinux
+**/tarballs
+**/linux-*
+**/target
+/libkrun.pc
+init/init
+.idea/
+.vscode/
+*IMP*.md

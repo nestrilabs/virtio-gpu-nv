@@ -31,6 +31,7 @@ pub const NVGPU_MSG_IOCTL: u32 = 3;
 pub const NVGPU_MSG_MMAP: u32 = 4;
 pub const NVGPU_MSG_MUNMAP: u32 = 5;
 pub const NVGPU_MSG_GET_PROC_FILES: u32 = 6;
+pub const NVGPU_MSG_GET_SYS_FILES: u32 = 7;
 
 /// device_type values for OPEN.
 pub const NVGPU_DEV_CTL: u32 = 255;

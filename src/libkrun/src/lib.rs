@@ -691,6 +691,9 @@ pub unsafe extern "C" fn krun_enable_nvgpu(
         return -libc::ENODEV;
     }
 
+    // ── Extract PCI addresses from selected GPUs ──────────────────────────────
+    let gpu_pci_addrs: Vec<String> = selected_gpus.iter().map(|g| g.pci_addr.clone()).collect();
+
     // ── Store config in the context ───────────────────────────────────────
     let config = GpuNvConfig {
         num_gpus: selected_gpus.len() as u32,
@@ -698,6 +701,8 @@ pub unsafe extern "C" fn krun_enable_nvgpu(
         driver_version: version.as_string(),
         gpus: selected_gpus,
         extra_proc: devices::virtio::gpu_nv::device::read_host_nvidia_proc_tree(),
+        sys_files: devices::virtio::gpu_nv::device::read_host_sys_files(),
+        dri_devices: devices::virtio::gpu_nv::device::find_dri_devices(&gpu_pci_addrs),
     };
 
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
