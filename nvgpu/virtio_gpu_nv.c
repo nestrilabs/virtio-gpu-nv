@@ -988,20 +988,26 @@ static void nvgpu_dir_cache_reset(void) {
   nvgpu_dir_cache_count = 0;
 }
 
-static struct proc_dir_entry *
+static struct proc_dir_entry *static struct proc_dir_entry *
 nvgpu_proc_mkdir_cached(const char *path, struct proc_dir_entry *parent) {
   int i;
+  struct proc_dir_entry *entry;
 
-  /* Check cache first */
-  for (i = 0; i < nvgpu_dir_cache_count; i++) {
+  /* Check our cache first */
+  for (i = 0; i < nvgpu_dir_cache_count; i++)
     if (strcmp(nvgpu_dir_cache[i].path, path) == 0)
       return nvgpu_dir_cache[i].entry;
-  }
 
-  /* Not cached — create it */
-  struct proc_dir_entry *entry = proc_mkdir(path, parent);
+  /*
+   * "driver" already exists in procfs — don't try to recreate it.
+   * Add other known-existing dirs here if the VMM sends more paths
+   * that collide with built-in proc entries.
+   */
+  if (parent == NULL && strcmp(path, "driver") == 0)
+    entry = NULL; /* proc_create_data with NULL parent+leaf works */
+  else
+    entry = proc_mkdir(path, parent);
 
-  /* Cache it even if NULL — so we don't retry failed creates */
   if (nvgpu_dir_cache_count < NVGPU_PROC_MAX_DIRS) {
     strscpy(nvgpu_dir_cache[nvgpu_dir_cache_count].path, path, 128);
     nvgpu_dir_cache[nvgpu_dir_cache_count].entry = entry;

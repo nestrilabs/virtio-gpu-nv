@@ -1,6 +1,6 @@
 #
 # Automatically generated file; DO NOT EDIT.
-# Linux/x86 6.6.59 Kernel Configuration
+# Linux/x86 6.19.11 Kernel Configuration
 #
 CONFIG_VIRTIO_GPU_NV=y
 CONFIG_VIRTIO_PCI=y
