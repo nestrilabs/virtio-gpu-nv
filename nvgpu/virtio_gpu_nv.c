@@ -10,7 +10,8 @@
  * Guest kernel driver — runs inside the VM.
  * Place in: drivers/virtio/virtio_gpu_nv.c (libkrunfw tree)
  */
-#include <drm/drm_drv.h>
+
+#include <drm/drm.h>
 #include <linux/cdev.h>
 #include <linux/completion.h>
 #include <linux/cpu.h>
@@ -19,14 +20,24 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/pci-ecam.h>
+#include <linux/pci.h>
 #include <linux/proc_fs.h>
 #include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/topology.h>
 #include <linux/uaccess.h>
 #include <linux/virtio.h>
 #include <linux/virtio_config.h>
 #include <linux/virtio_ids.h>
+
+#include "nvgpu_rm_intercepts.h"
+#include "nvgpu_rmalloc_classes.h"
+#include "nvgpu_v1v2_rewrites.h"
+
+/* module_kset is exported from kernel/module/sysfs.c */
+extern struct kset *module_kset;
 
 /* ───────── virtio device identity ───────── */
 
@@ -41,6 +52,8 @@
 
 #define NV_MAJOR 195
 #define NV_CTL_MINOR 255
+#define NV_UVM_MAJOR 237
+#define NV_CAPS_MAJOR 240
 
 /* ───────── Wire protocol constants ───────── */
 
@@ -69,6 +82,8 @@
 #define NV_ESC_RM_ALLOC 0x2b
 /* UVM_INITIALIZE ioctl nr */
 #define UVM_INITIALIZE_NR 0x30
+
+#define NVGPU_DEV_DRI_BASE 512
 
 /* ───────── Wire protocol structs ───────── */
 
@@ -202,9 +217,45 @@ struct NVOS64_PARAMETERS {
 
 /* ───────── Driver state ───────── */
 
-/*
- * Per-device state — one instance per virtio device probe.
- */
+struct nvgpu_device;
+
+struct nvgpu_dri_dev {
+  char name[32];
+  u32 major;
+  u32 minor;
+  u32 gpu_id;
+  struct cdev cdev;
+  bool registered;
+  u32 index;
+  struct nvgpu_device *dev;
+};
+
+struct nvgpu_numa_attr {
+  struct kobj_attribute kattr;
+  struct nvgpu_device *dev;
+  char *(*get_buf)(struct nvgpu_device *);
+};
+
+/* ── Fake PCI device state ── */
+struct nvgpu_pci_slot {
+  char pci_addr[16]; /* "0000:08:00.0"      */
+  u8 config[256];    /* raw config space    */
+  bool config_valid;
+  u16 domain;
+  u8 bus_nr;
+  u8 slot;
+  u8 func;
+};
+
+struct nvgpu_pci_root {
+  int domain; /* MUST be first — x86 pci_domain_nr()
+               * reads domain from sysdata offset 0 */
+  struct nvgpu_pci_slot slot;
+  struct nvgpu_device *nvdev; /* back pointer        */
+  struct pci_host_bridge *bridge;
+  bool registered;
+};
+
 struct nvgpu_device {
   struct virtio_device *vdev;
   struct virtqueue *ctrl_vq;
@@ -215,6 +266,8 @@ struct nvgpu_device {
   struct cdev cdev_ctl;      /* /dev/nvidiactl            */
   struct cdev cdev_uvm;      /* /dev/nvidia-uvm           */
   dev_t uvm_devno;           /* dynamic major for UVM     */
+  struct cdev cdev_caps;     /* /dev/nvidia-caps */
+  dev_t caps_devno;          /* dynamic major for nvidia-caps */
 
   /* Config read from VMM */
   char driver_version[32];
@@ -236,25 +289,18 @@ struct nvgpu_device {
   struct nvgpu_fd_translation_entry fd_translations[16];
   u32 num_fd_translations;
 
-  /* ── NUMA node sysfs (host data) ── */
-  struct kobject *numa_node_kobj;  /* /sys/devices/system/node        */
-  struct kobject *numa_node0_kobj; /* /sys/devices/system/node/node0  */
-  /* Storage for host-sourced content; shown verbatim via sysfs callbacks */
-  char numa_cpumap[128];
-  char numa_cpulist[64];
-  char numa_numastat[1024];
-  char numa_meminfo[2048];
-
-  /* ── DRI device nodes (host major:minor) ── */
+  /* ── DRI device nodes ── */
 #define NVGPU_MAX_DRI_DEVS 8
-  struct {
-    char name[32]; /* "renderD128" / "card1" */
-    u32 major;
-    u32 minor;
-    struct cdev cdev;
-    bool registered;
-  } dri_devs[NVGPU_MAX_DRI_DEVS];
+  struct nvgpu_dri_dev dri_devs[NVGPU_MAX_DRI_DEVS];
   int num_dri_devs;
+
+  /* ── PCI sysfs fake hierarchy ── */
+  struct kobject *pci_bus_kobj;     /* /sys/bus/pci              */
+  struct kobject *pci_devices_kobj; /* /sys/bus/pci/devices      */
+
+#define NVGPU_MAX_PCI_SLOTS 8
+  struct nvgpu_pci_root pci_roots[NVGPU_MAX_PCI_SLOTS];
+  int num_pci_roots;
 };
 
 /*
@@ -270,6 +316,171 @@ struct nvgpu_fd {
 
 /* class for device_create() */
 static struct class *nvgpu_class;
+
+/* ───────── nvidia-drm stub — no DRM subsystem headers needed ───────── */
+
+static long nvgpu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
+
+/*
+ * We handle DRM ioctls without involving drm_ioctl() because that function
+ * immediately casts filp->private_data to struct drm_file * and dereferences
+ * ->minor->dev — our private_data is struct nvgpu_fd *, not struct drm_file *.
+ *
+ * All types used below are stable UAPI structs; we define only what we use.
+ */
+
+/* _IOC_TYPE byte for DRM ioctls */
+#define DRM_IOCTL_BASE 'd'
+#define DRM_COMMAND_BASE 0x40
+
+/* DRM_NVIDIA_* are offsets from DRM_COMMAND_BASE */
+#define DRM_NVIDIA_GET_DEV_INFO 0x03     /* abs nr 0x43 */
+#define DRM_NVIDIA_FENCE_SUPPORTED 0x04  /* abs nr 0x44 */
+#define DRM_NVIDIA_DMABUF_SUPPORTED 0x0f /* abs nr 0x4f */
+
+/*
+ * struct drm_version — UAPI, stable since DRM was upstreamed.
+ * Copy of include/uapi/drm/drm.h:struct drm_version so we need
+ * no DRM kernel headers.
+ */
+struct nvgpu_drm_version {
+  int version_major;
+  int version_minor;
+  int version_patchlevel;
+  size_t name_len;
+  char __user *name;
+  size_t date_len;
+  char __user *date;
+  size_t desc_len;
+  char __user *desc;
+};
+
+struct drm_nvidia_get_dev_info_params {
+  __u32 gpu_id;
+  __u32 mig_device;
+  __u32 primary_index;
+  __u32 supports_alloc;
+  __u32 generic_page_kind;
+  __u32 page_kind_generation;
+  __u32 sector_layout;
+  __u32 supports_sync_fd;
+  __u32 supports_semsurf;
+} __packed;
+
+/*
+ * nvgpu_drm_handle_ioctl — handle all DRM-layer ioctls on our /dev/dri/..
+ * nodes.
+ *
+ * DRM_IOCTL_VERSION  (nr=0x00) — core ioctl, returns name="nvidia-drm"
+ * GET_DEV_INFO       (nr=0x43) — driver ioctl, returns gpu_id etc.
+ * FENCE_SUPPORTED    (nr=0x44) — driver ioctl, returns 0
+ * DMABUF_SUPPORTED   (nr=0x4f) — driver ioctl, returns 0
+ *
+ * Everything else → -ENOTTY.
+ */
+static long nvgpu_drm_handle_ioctl(struct nvgpu_fd *nfd,
+                                   struct nvgpu_dri_dev *dri, unsigned int cmd,
+                                   unsigned long arg) {
+  unsigned int nr = _IOC_NR(cmd);
+  void __user *uarg = (void __user *)arg;
+
+  /* ── DRM_IOCTL_VERSION (type='d', nr=0x00) ── */
+  if (nr == 0x00) {
+    struct nvgpu_drm_version v;
+
+    if (copy_from_user(&v, uarg, sizeof(v)))
+      return -EFAULT;
+
+    v.version_major = 0;
+    v.version_minor = 1;
+    v.version_patchlevel = 0;
+
+#define FILL_DRM_STR(field, str)                                               \
+  do {                                                                         \
+    const char *_s = (str);                                                    \
+    size_t _sl = strlen(_s);                                                   \
+    if (v.field##_len >= _sl && v.field)                                       \
+      if (copy_to_user(v.field, _s, _sl))                                      \
+        return -EFAULT;                                                        \
+    v.field##_len = _sl;                                                       \
+  } while (0)
+
+    FILL_DRM_STR(name, "nvidia-drm");
+    FILL_DRM_STR(date, "20240101");
+    FILL_DRM_STR(desc, "NVIDIA DRM stub");
+#undef FILL_DRM_STR
+
+    if (copy_to_user(uarg, &v, sizeof(v)))
+      return -EFAULT;
+
+    return 0;
+  }
+
+  /* ── Driver ioctls: DRM_COMMAND_BASE .. DRM_COMMAND_END ── */
+  if (nr < DRM_COMMAND_BASE || nr >= DRM_COMMAND_END)
+    return -ENOTTY;
+
+  switch (nr - DRM_COMMAND_BASE) {
+
+  case DRM_NVIDIA_GET_DEV_INFO: {
+    struct drm_nvidia_get_dev_info_params p;
+
+    memset(&p, 0, sizeof(p));
+    p.gpu_id = dri->gpu_id;
+    p.mig_device = 0;
+    p.primary_index = 0;
+    p.supports_alloc = 1;
+    p.generic_page_kind = 6; /* Turing/Ampere */
+    p.page_kind_generation = 2;
+    p.sector_layout = 1;
+    p.supports_sync_fd = 1;
+    p.supports_semsurf = 1;
+
+    if (copy_to_user(uarg, &p, sizeof(p)))
+      return -EFAULT;
+    return 0;
+  }
+
+  case DRM_NVIDIA_FENCE_SUPPORTED:
+    return 0; /* not supported, no payload */
+
+  case DRM_NVIDIA_DMABUF_SUPPORTED:
+    return 0; /* not supported, no payload */
+
+  default:
+    return -ENOTTY;
+  }
+}
+
+/*
+ * nvgpu_dri_ioctl — combined ioctl for /dev/dri/.. nodes.
+ *
+ *   type 'd' → handled locally (DRM VERSION + nvidia-drm driver ioctls)
+ *   type 'F' → proxied to host via virtqueue (NVIDIA RM ioctls)
+ */
+static long nvgpu_dri_ioctl(struct file *filp, unsigned int cmd,
+                            unsigned long arg) {
+  if (_IOC_TYPE(cmd) == DRM_IOCTL_BASE) {
+    struct nvgpu_fd *nfd = filp->private_data;
+    struct nvgpu_dri_dev *dri = NULL;
+    int i;
+
+    for (i = 0; i < nfd->dev->num_dri_devs; i++) {
+      if ((u32)i == nfd->device_type - NVGPU_DEV_DRI_BASE) {
+        dri = &nfd->dev->dri_devs[i];
+        break;
+      }
+    }
+
+    if (!dri)
+      return -ENODEV;
+
+    return nvgpu_drm_handle_ioctl(nfd, dri, cmd, arg);
+  }
+
+  /* NVIDIA-type and everything else → proxy to host */
+  return nvgpu_ioctl(filp, cmd, arg);
+}
 
 /* ───────── Virtqueue communication ───────── */
 
@@ -334,10 +545,7 @@ static void nvgpu_event_vq_cb(struct virtqueue *vq) {
 
 /* ───────── Ioctl forwarding ───────── */
 
-/*
- * nvgpu_ioctl_simple — flat struct, no embedded pointers.
- * Covers ~95 % of NVIDIA ioctls.
- */
+/* nvgpu_ioctl_simple — flat struct, no embedded pointers */
 static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
                                void __user *uarg, unsigned int sz) {
   int req_total = sizeof(struct nvgpu_ioctl_req) + sz;
@@ -364,82 +572,8 @@ static long nvgpu_ioctl_simple(struct nvgpu_fd *nfd, unsigned int cmd,
   req->nested_offset = 0;
   req->nested_len = 0;
 
-  if (copy_from_user(req_buf + sizeof(*req), uarg, sz)) {
-    ret = -EFAULT;
-    goto out;
-  }
-
-  ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
-  if (ret < 0)
-    goto out;
-
-  resp = (struct nvgpu_ioctl_resp *)resp_buf;
-  ret = (int)le32_to_cpu((__le32)resp->hdr.status);
-
-  if (resp->data_len && le32_to_cpu(resp->data_len) <= sz) {
-    if (copy_to_user(uarg, resp_buf + sizeof(*resp),
-                     le32_to_cpu(resp->data_len)))
-      ret = -EFAULT;
-  }
-
-out:
-  kfree(req_buf);
-  kfree(resp_buf);
-  return ret;
-}
-
-/*
- * nvgpu_ioctl_rm_control — NV_ESC_RM_CONTROL has a nested params buffer
- * addressed via NVOS54_PARAMETERS.params.
- */
-static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
-                                   void __user *uarg, unsigned int sz) {
-  struct NVOS54_PARAMETERS params;
-  void __user *user_nested;
-  void *req_buf = NULL, *resp_buf = NULL, *nested;
-  struct nvgpu_ioctl_req *req;
-  struct nvgpu_ioctl_resp *resp;
-  int req_total, resp_max, ret;
-
-  if (sz < sizeof(params))
-    return -EINVAL;
-
-  if (copy_from_user(&params, uarg, sizeof(params)))
-    return -EFAULT;
-
-  user_nested = (void __user *)(unsigned long)le64_to_cpu(params.params);
-
-  if (le32_to_cpu(params.paramsSize) > 1024 * 1024)
-    return -EINVAL;
-
-  req_total = sizeof(*req) + sizeof(params) + le32_to_cpu(params.paramsSize);
-  resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(params) +
-             le32_to_cpu(params.paramsSize);
-
-  req_buf = kmalloc(req_total, GFP_KERNEL);
-  resp_buf = kmalloc(resp_max, GFP_KERNEL);
-  if (!req_buf || !resp_buf) {
-    ret = -ENOMEM;
-    goto out;
-  }
-
-  req = (struct nvgpu_ioctl_req *)req_buf;
-  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
-  req->hdr.handle = cpu_to_le32(nfd->handle);
-  req->hdr.status = 0;
-  req->hdr.padding = 0;
-  req->cmd = cpu_to_le32(cmd);
-  req->data_len = cpu_to_le32(sizeof(params));
-  req->nested_offset = cpu_to_le32(sizeof(params));
-  req->nested_len = params.paramsSize; /* already LE */
-
-  /* Copy top-level struct (guest pointer left in place; VMM ignores it) */
-  memcpy(req_buf + sizeof(*req), &params, sizeof(params));
-
-  /* Copy nested data from guest userspace */
-  if (user_nested && le32_to_cpu(params.paramsSize) > 0) {
-    nested = req_buf + sizeof(*req) + sizeof(params);
-    if (copy_from_user(nested, user_nested, le32_to_cpu(params.paramsSize))) {
+  if (sz > 0) {
+    if (copy_from_user(req_buf + sizeof(*req), uarg, sz)) {
       ret = -EFAULT;
       goto out;
     }
@@ -452,16 +586,9 @@ static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
   ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
 
-  /* Copy modified top-level struct back */
-  if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(params))) {
-    ret = -EFAULT;
-    goto out;
-  }
-
-  /* Copy modified nested data back to original guest pointer */
-  if (user_nested && le32_to_cpu(resp->nested_len) > 0) {
-    if (copy_to_user(user_nested, resp_buf + sizeof(*resp) + sizeof(params),
-                     le32_to_cpu(resp->nested_len)))
+  if (sz > 0 && resp->data_len && le32_to_cpu(resp->data_len) <= sz) {
+    if (copy_to_user(uarg, resp_buf + sizeof(*resp),
+                     le32_to_cpu(resp->data_len)))
       ret = -EFAULT;
   }
 
@@ -472,13 +599,29 @@ out:
 }
 
 /*
- * nvgpu_ioctl_rm_alloc — NV_ESC_RM_ALLOC, same pattern via NVOS64_PARAMETERS.
+ * nvgpu_ioctl_rm_control — NV_ESC_RM_CONTROL with nested params buffer.
+ *
+ * Handles three cases:
+ *   1. Normal: nested params are flat data → marshal and forward
+ *   2. V1→V2 rewrite: nested params contain a second userspace pointer
+ *      that we can't forward → rewrite to V2 inline variant
+ *   3. paramsSize == 0 or params == NULL → forward outer struct only
  */
-static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
-                                 void __user *uarg, unsigned int sz) {
-  struct NVOS64_PARAMETERS params;
-  void __user *user_alloc;
-  void *req_buf = NULL, *resp_buf = NULL, *nested;
+static long nvgpu_ioctl_rm_control(struct nvgpu_fd *nfd, unsigned int cmd,
+                                   void __user *uarg, unsigned int sz) {
+  struct NVOS54_PARAMETERS params;
+  void __user *user_nested;
+  u32 nested_size;
+  u32 ctl_cmd;
+  const struct nvgpu_v1v2_entry *rw;
+
+  /* V1→V2 rewrite state */
+  u64 saved_user_ptr = 0;
+  u32 saved_user_data_size = 0;
+  u32 saved_v1_cmd = 0;
+  u32 saved_v1_params_size = 0;
+
+  void *req_buf = NULL, *resp_buf = NULL;
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
   int req_total, resp_max, ret;
@@ -489,14 +632,175 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   if (copy_from_user(&params, uarg, sizeof(params)))
     return -EFAULT;
 
-  user_alloc = (void __user *)(unsigned long)le64_to_cpu(params.pAllocParms);
+  user_nested = (void __user *)(unsigned long)le64_to_cpu(params.params);
+  nested_size = le32_to_cpu(params.paramsSize);
+  ctl_cmd = le32_to_cpu(params.cmd);
 
-  if (le32_to_cpu(params.paramsSize) > 1024 * 1024)
+  if (nested_size > 1024 * 1024)
     return -EINVAL;
 
-  req_total = sizeof(*req) + sizeof(params) + le32_to_cpu(params.paramsSize);
-  resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(params) +
-             le32_to_cpu(params.paramsSize);
+  /* Intercept multi-pointer commands that can't be forwarded */
+  {
+    long intercept_ret;
+    if (nvgpu_try_intercept_rm_control(nfd, ctl_cmd, uarg, user_nested,
+                                       nested_size, nfd->dev->driver_version,
+                                       &intercept_ret))
+      return intercept_ret;
+  }
+
+  /*
+   * Check for V1→V2 rewrite.  Only when we have nested params that
+   * contain a second-level userspace pointer we can't forward.
+   */
+  rw = (user_nested && nested_size > 0) ? nvgpu_find_v1v2_rewrite(ctl_cmd)
+                                        : NULL;
+
+  if (rw) {
+    void *v1_buf;
+    u32 min_v1_size;
+
+    /* Read V1 nested params from guest userspace */
+    min_v1_size = rw->v1_userptr_offset + 8;
+    if (nested_size < min_v1_size) {
+      pr_warn(
+          "virtio-gpu-nv: v1v2: V1 nested too small (%u < %u) for cmd 0x%x\n",
+          nested_size, min_v1_size, ctl_cmd);
+      rw = NULL;
+      goto do_normal;
+    }
+
+    v1_buf = kmalloc(nested_size, GFP_KERNEL);
+    if (!v1_buf)
+      return -ENOMEM;
+
+    if (copy_from_user(v1_buf, user_nested, nested_size)) {
+      kfree(v1_buf);
+      return -EFAULT;
+    }
+
+    /* Extract the userspace data pointer from V1 nested params */
+    memcpy(&saved_user_ptr, v1_buf + rw->v1_userptr_offset, sizeof(u64));
+
+    if (!saved_user_ptr) {
+      pr_debug("virtio-gpu-nv: v1v2: data pointer is NULL for cmd 0x%x, normal "
+               "path\n",
+               ctl_cmd);
+      kfree(v1_buf);
+      rw = NULL;
+      goto do_normal;
+    }
+
+    /* Compute how many bytes of result data guest expects back */
+    if (rw->info_style && rw->v1_copy_prefix >= 4) {
+      u32 list_size;
+      memcpy(&list_size, v1_buf, sizeof(u32));
+      saved_user_data_size = min_t(u32, list_size * 8, rw->v2_data_size);
+    } else {
+      u32 caps_tbl_size;
+      memcpy(&caps_tbl_size, v1_buf, sizeof(u32));
+      saved_user_data_size = min_t(u32, caps_tbl_size, rw->v2_data_size);
+    }
+
+    saved_v1_cmd = ctl_cmd;
+    saved_v1_params_size = nested_size;
+
+    pr_debug("virtio-gpu-nv: v1v2: rewriting cmd 0x%x → 0x%x (V2 %u bytes, "
+             "data_back %u)\n",
+             ctl_cmd, rw->v2_cmd, rw->v2_size, saved_user_data_size);
+
+    /* Build V2 nested buffer (zeroed) */
+    nested_size = rw->v2_size;
+
+    req_total = sizeof(struct nvgpu_ioctl_req) + sizeof(params) + nested_size;
+    resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + nested_size;
+
+    req_buf = kzalloc(req_total, GFP_KERNEL);
+    resp_buf = kzalloc(resp_max, GFP_KERNEL);
+    if (!req_buf || !resp_buf) {
+      kfree(v1_buf);
+      ret = -ENOMEM;
+      goto out;
+    }
+
+    /* Copy prefix from V1 into V2 (e.g. listSize or ceEngineType) */
+    if (rw->v1_copy_prefix > 0) {
+      u32 pfx = min_t(u32, rw->v1_copy_prefix, (u32)(nested_size));
+      memcpy(req_buf + sizeof(struct nvgpu_ioctl_req) + sizeof(params), v1_buf,
+             pfx);
+    }
+
+    kfree(v1_buf);
+
+    /* Patch outer: replace cmd with V2, update paramsSize */
+    params.cmd = cpu_to_le32(rw->v2_cmd);
+    params.paramsSize = cpu_to_le32(nested_size);
+
+    /* Fill request header */
+    req = (struct nvgpu_ioctl_req *)req_buf;
+    req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
+    req->hdr.handle = cpu_to_le32(nfd->handle);
+    req->hdr.status = 0;
+    req->hdr.padding = 0;
+    req->cmd = cpu_to_le32(cmd);
+    req->data_len = cpu_to_le32(sizeof(params));
+    req->nested_offset = cpu_to_le32(sizeof(params));
+    req->nested_len = cpu_to_le32(nested_size);
+
+    memcpy(req_buf + sizeof(*req), &params, sizeof(params));
+
+    ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
+    if (ret < 0)
+      goto out;
+
+    resp = (struct nvgpu_ioctl_resp *)resp_buf;
+    ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
+
+    /* ── V1→V2 response path ── */
+
+    /* Copy V2 inline result data back to guest's original userspace pointer */
+    if (le32_to_cpu(resp->nested_len) > 0 && saved_user_ptr &&
+        saved_user_data_size > 0) {
+      u32 resp_nested = le32_to_cpu(resp->nested_len);
+      u32 avail = 0;
+
+      if (resp_nested > rw->v2_data_offset)
+        avail = resp_nested - rw->v2_data_offset;
+
+      if (avail > 0) {
+        u32 copy_back = min_t(u32, saved_user_data_size, avail);
+        if (copy_to_user((void __user *)saved_user_ptr,
+                         resp_buf + sizeof(*resp) + sizeof(params) +
+                             rw->v2_data_offset,
+                         copy_back)) {
+          ret = -EFAULT;
+          goto out;
+        }
+      }
+    }
+
+    /* Restore V1 outer fields before copying back to userspace:
+     * cmd → original V1 cmd, paramsSize → original, params ptr → original */
+    {
+      struct NVOS54_PARAMETERS *resp_params =
+          (struct NVOS54_PARAMETERS *)(resp_buf + sizeof(*resp));
+      resp_params->cmd = cpu_to_le32(saved_v1_cmd);
+      resp_params->paramsSize = cpu_to_le32(saved_v1_params_size);
+      resp_params->params = cpu_to_le64((u64)(unsigned long)user_nested);
+    }
+
+    if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(params))) {
+      ret = -EFAULT;
+      goto out;
+    }
+
+    goto out;
+  }
+
+do_normal:
+  /* ── Normal path (no V1→V2 rewrite) ── */
+
+  req_total = sizeof(struct nvgpu_ioctl_req) + sizeof(params) + nested_size;
+  resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + nested_size;
 
   req_buf = kmalloc(req_total, GFP_KERNEL);
   resp_buf = kmalloc(resp_max, GFP_KERNEL);
@@ -513,13 +817,110 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   req->cmd = cpu_to_le32(cmd);
   req->data_len = cpu_to_le32(sizeof(params));
   req->nested_offset = cpu_to_le32(sizeof(params));
-  req->nested_len = params.paramsSize;
+  req->nested_len = cpu_to_le32(nested_size);
 
   memcpy(req_buf + sizeof(*req), &params, sizeof(params));
 
-  if (user_alloc && le32_to_cpu(params.paramsSize) > 0) {
+  if (user_nested && nested_size > 0) {
+    if (copy_from_user(req_buf + sizeof(*req) + sizeof(params), user_nested,
+                       nested_size)) {
+      ret = -EFAULT;
+      goto out;
+    }
+  }
+
+  ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
+  if (ret < 0)
+    goto out;
+
+  resp = (struct nvgpu_ioctl_resp *)resp_buf;
+  ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
+
+  if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(params))) {
+    ret = -EFAULT;
+    goto out;
+  }
+
+  if (user_nested && le32_to_cpu(resp->nested_len) > 0) {
+    u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
+    if (copy_to_user(user_nested, resp_buf + sizeof(*resp) + sizeof(params),
+                     copy_back))
+      ret = -EFAULT;
+  }
+
+out:
+  kfree(req_buf);
+  kfree(resp_buf);
+  return ret;
+}
+
+/*
+ * nvgpu_ioctl_rm_alloc — NV_ESC_RM_ALLOC, same pattern via NVOS64_PARAMETERS.
+ *
+ * Subtlety: when paramsSize == 0 but pAllocParms != NULL, the host RM
+ * driver determines size from hClass.  We must look up the size ourselves
+ * so we know how many bytes to copy_from_user.
+ */
+static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
+                                 void __user *uarg, unsigned int sz) {
+  struct NVOS64_PARAMETERS params;
+  void __user *user_alloc;
+  u32 nested_size;
+  void *req_buf = NULL, *resp_buf = NULL, *nested;
+  struct nvgpu_ioctl_req *req;
+  struct nvgpu_ioctl_resp *resp;
+  int req_total, resp_max, ret;
+
+  if (sz < sizeof(params))
+    return -EINVAL;
+
+  if (copy_from_user(&params, uarg, sizeof(params)))
+    return -EFAULT;
+
+  user_alloc = (void __user *)(unsigned long)le64_to_cpu(params.pAllocParms);
+  nested_size = le32_to_cpu(params.paramsSize);
+
+  /*
+   * When paramsSize == 0 but pAllocParms is non-NULL,
+   * the host RM driver knows the size from hClass.  We need to copy
+   * that many bytes from guest userspace so the VMM can forward them.
+   */
+  if (user_alloc && nested_size == 0) {
+    u32 hClass = le32_to_cpu(params.hClass);
+    nested_size = nvgpu_rmalloc_class_param_size(hClass);
+    pr_debug(
+        "virtio-gpu-nv: RM_ALLOC hClass=0x%04x paramsSize=0 → copy %u bytes\n",
+        hClass, nested_size);
+  }
+
+  if (nested_size > 1024 * 1024)
+    return -EINVAL;
+
+  req_total = sizeof(*req) + sizeof(params) + nested_size;
+  resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + nested_size;
+
+  req_buf = kmalloc(req_total, GFP_KERNEL);
+  resp_buf = kmalloc(resp_max, GFP_KERNEL);
+  if (!req_buf || !resp_buf) {
+    ret = -ENOMEM;
+    goto out;
+  }
+
+  req = (struct nvgpu_ioctl_req *)req_buf;
+  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
+  req->hdr.handle = cpu_to_le32(nfd->handle);
+  req->hdr.status = 0;
+  req->hdr.padding = 0;
+  req->cmd = cpu_to_le32(cmd);
+  req->data_len = cpu_to_le32(sizeof(params));
+  req->nested_offset = cpu_to_le32(sizeof(params));
+  req->nested_len = cpu_to_le32(nested_size);
+
+  memcpy(req_buf + sizeof(*req), &params, sizeof(params));
+
+  if (user_alloc && nested_size > 0) {
     nested = req_buf + sizeof(*req) + sizeof(params);
-    if (copy_from_user(nested, user_alloc, le32_to_cpu(params.paramsSize))) {
+    if (copy_from_user(nested, user_alloc, nested_size)) {
       ret = -EFAULT;
       goto out;
     }
@@ -538,8 +939,9 @@ static long nvgpu_ioctl_rm_alloc(struct nvgpu_fd *nfd, unsigned int cmd,
   }
 
   if (user_alloc && le32_to_cpu(resp->nested_len) > 0) {
+    u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
     if (copy_to_user(user_alloc, resp_buf + sizeof(*resp) + sizeof(params),
-                     le32_to_cpu(resp->nested_len)))
+                     copy_back))
       ret = -EFAULT;
   }
 
@@ -661,14 +1063,10 @@ static long nvgpu_ioctl(struct file *filp, unsigned int cmd,
   void __user *uarg = (void __user *)arg;
   const struct nvgpu_fd_translation_entry *fdt;
 
-  /*
-   * Most ioctls are small structs.  NV_ESC_CARD_INFO is the exception:
-   * its full form carries a table of up to 32 GPU entries and comes in
-   * well above 4096 bytes on recent drivers (~5000 bytes for 535+).
-   * Use a generous per-ioctl cap rather than one global limit.
-   * Hard cap: no single ioctl struct should exceed 64 KiB
-   */
-  if (sz == 0 || sz > 65536)
+  /* Hard cap only — sz == 0 is valid for several NVIDIA ioctls
+   * (e.g. NV_ESC_RM_FREE on some driver versions, and any ioctl
+   * that encodes parameters via _IOC_NR only with no struct). */
+  if (sz > 65536)
     return -EINVAL;
 
   fdt = nvgpu_find_fd_translation(nfd->dev, nr);
@@ -688,10 +1086,6 @@ static long nvgpu_ioctl(struct file *filp, unsigned int cmd,
 
 /* ───────── UVM ioctl ───────── */
 
-/*
- * UVM ioctls are all flat (no nested pointers), with one exception:
- * UVM_INITIALIZE gets the multi-process sharing flag injected.
- */
 static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
                             unsigned long arg) {
   struct nvgpu_fd *nfd = filp->private_data;
@@ -699,27 +1093,89 @@ static long nvgpu_uvm_ioctl(struct file *filp, unsigned int cmd,
   unsigned int sz = _IOC_SIZE(cmd);
   void __user *uarg = (void __user *)arg;
 
-  if (sz == 0)
-    return -EINVAL;
-  if (sz > 65536)
-    return -EINVAL;
-
-  if (nr == UVM_INITIALIZE_NR) {
-    /*
-     * Set UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE so the host
-     * driver allows this UVM context to be shared across processes
-     * (one per VM).  The flag is at offset 0 in UvmInitializeParams.
-     * We read, OR the bit, write back, then forward.
-     */
-    u64 flags;
-
-    if (sz >= sizeof(flags)) {
-      if (copy_from_user(&flags, uarg, sizeof(flags)))
-        return -EFAULT;
-      flags |= (1ULL << 2); /* UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE */
-      if (copy_to_user(uarg, &flags, sizeof(flags)))
-        return -EFAULT;
+  /*
+   * UVM ioctls use _IOC(0, 0, nr, 0x3000) — type=0, size=0x3000.
+   * _IOC_SIZE() returns 0x3000 which is the max buffer, not the
+   * actual struct size. Use the real struct sizes instead.
+   *
+   * UVM_INITIALIZE     (nr=1): flags:u64 + rmStatus:u32 + pad = 16 bytes
+   * UVM_MM_INITIALIZE  (nr=2): uvmFd:s32 + rmStatus:u32        =  8 bytes
+   *
+   * For all other UVM ioctls we use 0x3000 as an upper bound since
+   * we don't know their sizes — the host driver will only read what
+   * it needs.
+   */
+  if (sz == 0 || sz == 0x3000) {
+    switch (nr) {
+    case 1:
+      sz = 16;
+      break; /* UVM_INITIALIZE        */
+    case 2:
+      sz = 8;
+      break; /* UVM_MM_INITIALIZE     */
+    default:
+      sz = 0x3000;
+      break;
     }
+  }
+
+  if (sz > 0x3000)
+    return -EINVAL;
+
+  /*
+   * UVM_MM_INITIALIZE passes arg=0 (NULL) because the uvmFd is
+   * embedded in the ioctl struct on some driver versions, or the
+   * kernel side doesn't need userspace params at all.
+   * Forward with a zeroed buffer — host will fill rmStatus.
+   */
+  if (arg == 0) {
+    /*
+     * Can't copy_from_user a NULL pointer. Build a zeroed buffer
+     * and send it; the host UVM driver will populate rmStatus.
+     */
+    int req_total = sizeof(struct nvgpu_ioctl_req) + sz;
+    int resp_max = sizeof(struct nvgpu_ioctl_resp) + sz;
+    void *req_buf, *resp_buf;
+    struct nvgpu_ioctl_req *req;
+    struct nvgpu_ioctl_resp *resp;
+    int ret;
+
+    req_buf = kzalloc(req_total, GFP_KERNEL);
+    resp_buf = kzalloc(resp_max, GFP_KERNEL);
+    if (!req_buf || !resp_buf) {
+      kfree(req_buf);
+      kfree(resp_buf);
+      return -ENOMEM;
+    }
+
+    req = (struct nvgpu_ioctl_req *)req_buf;
+    req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_IOCTL);
+    req->hdr.handle = cpu_to_le32(nfd->handle);
+    req->cmd = cpu_to_le32(cmd);
+    req->data_len = cpu_to_le32(sz);
+    /* payload stays zeroed — no copy_from_user */
+
+    ret = nvgpu_send_recv(nfd->dev, req_buf, req_total, resp_buf, resp_max);
+
+    if (ret == 0) {
+      resp = (struct nvgpu_ioctl_resp *)resp_buf;
+      ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
+      /* arg=0 means no copy_to_user either */
+    }
+
+    kfree(req_buf);
+    kfree(resp_buf);
+    return ret;
+  }
+
+  /* UVM_INITIALIZE: inject MULTI_PROCESS_SHARING_MODE flag */
+  if (nr == 1) {
+    u64 flags;
+    if (copy_from_user(&flags, uarg, sizeof(flags)))
+      return -EFAULT;
+    flags |= (1ULL << 2);
+    if (copy_to_user(uarg, &flags, sizeof(flags)))
+      return -EFAULT;
   }
 
   return nvgpu_ioctl_simple(nfd, cmd, uarg, sz);
@@ -991,21 +1447,17 @@ static void nvgpu_dir_cache_reset(void) {
 static struct proc_dir_entry *
 nvgpu_proc_mkdir_cached(const char *path, struct proc_dir_entry *parent) {
   int i;
-  struct proc_dir_entry *entry;
 
-  /* Check our cache first */
-  for (i = 0; i < nvgpu_dir_cache_count; i++)
+  /* Check cache first */
+  for (i = 0; i < nvgpu_dir_cache_count; i++) {
     if (strcmp(nvgpu_dir_cache[i].path, path) == 0)
       return nvgpu_dir_cache[i].entry;
+  }
 
-  /*
-   * "driver" already exists in procfs — don't try to recreate it.
-   */
-  if (parent == NULL && strcmp(path, "driver") == 0)
-    entry = NULL;
-  else
-    entry = proc_mkdir(path, parent);
+  /* Not cached — create it */
+  struct proc_dir_entry *entry = proc_mkdir(path, parent);
 
+  /* Cache it even if NULL — so we don't retry failed creates */
   if (nvgpu_dir_cache_count < NVGPU_PROC_MAX_DIRS) {
     strscpy(nvgpu_dir_cache[nvgpu_dir_cache_count].path, path, 128);
     nvgpu_dir_cache[nvgpu_dir_cache_count].entry = entry;
@@ -1149,165 +1601,65 @@ out:
   return ret;
 }
 
-/* ───────── Module-global device pointer ───────────────────────────────────
- * libkrun is single-VM-per-process so there is exactly one nvgpu_device.
- * sysfs show callbacks need access to the stored host content; they use
- * this pointer rather than trying to recover it from the kobject tree.
- * Set in nvgpu_probe, cleared in nvgpu_remove.
- */
-static struct nvgpu_device *g_nvgpu_dev;
-
-/* ───────── NUMA node sysfs (host passthrough) ───────────────────────────── */
-/*
- * NVML opens /sys/devices/system/node to enumerate NUMA nodes and reads
- * node0/cpumap for CPU affinity.  We ask the VMM for the real host content
- * via NVGPU_MSG_GET_SYS_FILES, store it in nvgpu_device, then create a
- * minimal kobject tree whose show functions return that stored data.
- *
- * Finding /sys/devices/system without an exported kset pointer:
- *   get_cpu_device(0)->kobj.parent        = /sys/devices/system/cpu
- *   get_cpu_device(0)->kobj.parent->parent = /sys/devices/system
- */
-
-static ssize_t nvgpu_numa_cpumap_show(struct kobject *kobj,
-                                      struct kobj_attribute *attr, char *buf) {
-  if (!g_nvgpu_dev || !g_nvgpu_dev->numa_cpumap[0])
-    return 0;
-  return scnprintf(buf, PAGE_SIZE, "%s", g_nvgpu_dev->numa_cpumap);
-}
-
-static ssize_t nvgpu_numa_cpulist_show(struct kobject *kobj,
-                                       struct kobj_attribute *attr, char *buf) {
-  if (!g_nvgpu_dev || !g_nvgpu_dev->numa_cpulist[0])
-    return 0;
-  return scnprintf(buf, PAGE_SIZE, "%s", g_nvgpu_dev->numa_cpulist);
-}
-
-static ssize_t nvgpu_numa_numastat_show(struct kobject *kobj,
-                                        struct kobj_attribute *attr,
-                                        char *buf) {
-  if (!g_nvgpu_dev || !g_nvgpu_dev->numa_numastat[0])
-    return 0;
-  return scnprintf(buf, PAGE_SIZE, "%s", g_nvgpu_dev->numa_numastat);
-}
-
-static ssize_t nvgpu_numa_meminfo_show(struct kobject *kobj,
-                                       struct kobj_attribute *attr, char *buf) {
-  if (!g_nvgpu_dev || !g_nvgpu_dev->numa_meminfo[0])
-    return 0;
-  return scnprintf(buf, PAGE_SIZE, "%s", g_nvgpu_dev->numa_meminfo);
-}
-
-static struct kobj_attribute nvgpu_attr_cpumap = __ATTR_RO(nvgpu_numa_cpumap);
-static struct kobj_attribute nvgpu_attr_cpulist = __ATTR_RO(nvgpu_numa_cpulist);
-static struct kobj_attribute nvgpu_attr_numastat =
-    __ATTR_RO(nvgpu_numa_numastat);
-static struct kobj_attribute nvgpu_attr_meminfo = __ATTR_RO(nvgpu_numa_meminfo);
-
-static struct attribute *nvgpu_node0_attrs[] = {
-    &nvgpu_attr_cpumap.attr,
-    &nvgpu_attr_cpulist.attr,
-    &nvgpu_attr_numastat.attr,
-    &nvgpu_attr_meminfo.attr,
-    NULL,
-};
-static const struct attribute_group nvgpu_node0_group = {
-    .attrs = nvgpu_node0_attrs,
-};
-
-static int nvgpu_numa_init(struct nvgpu_device *dev) {
-  struct device *cpu0;
-  struct kobject *system_kobj;
-  int ret;
-
-  if (!dev->numa_cpumap[0]) {
-    dev_warn(&dev->vdev->dev, "virtio-gpu-nv: no NUMA cpumap from host, "
-                              "skipping node sysfs\n");
-    return 0; /* non-fatal */
-  }
-
-  cpu0 = get_cpu_device(0);
-  if (!cpu0 || !cpu0->kobj.parent || !cpu0->kobj.parent->parent) {
-    dev_warn(&dev->vdev->dev,
-             "virtio-gpu-nv: unexpected cpu0 kobj hierarchy\n");
-    return 0;
-  }
-  system_kobj = cpu0->kobj.parent->parent;
-
-  /* Rename attributes to the canonical sysfs names */
-  nvgpu_attr_cpumap.attr.name = "cpumap";
-  nvgpu_attr_cpulist.attr.name = "cpulist";
-  nvgpu_attr_numastat.attr.name = "numastat";
-  nvgpu_attr_meminfo.attr.name = "meminfo";
-
-  dev->numa_node_kobj = kobject_create_and_add("node", system_kobj);
-  if (!dev->numa_node_kobj) {
-    dev_info(&dev->vdev->dev, "virtio-gpu-nv: /sys/.../node already exists\n");
-    return 0; /* kernel has NUMA built-in — fine */
-  }
-
-  dev->numa_node0_kobj = kobject_create_and_add("node0", dev->numa_node_kobj);
-  if (!dev->numa_node0_kobj) {
-    dev_err(&dev->vdev->dev, "virtio-gpu-nv: node0 kobject_create failed\n");
-    ret = -ENOMEM;
-    goto err_node;
-  }
-
-  ret = sysfs_create_group(dev->numa_node0_kobj, &nvgpu_node0_group);
-  if (ret) {
-    dev_err(&dev->vdev->dev, "virtio-gpu-nv: node0 sysfs_create_group: %d\n",
-            ret);
-    goto err_node0;
-  }
-
-  dev_info(&dev->vdev->dev,
-           "virtio-gpu-nv: created /sys/devices/system/node/node0 "
-           "(cpumap=%s)\n",
-           dev->numa_cpumap);
-  return 0;
-
-err_node0:
-  kobject_put(dev->numa_node0_kobj);
-  dev->numa_node0_kobj = NULL;
-err_node:
-  kobject_put(dev->numa_node_kobj);
-  dev->numa_node_kobj = NULL;
-  return ret;
-}
-
-static void nvgpu_numa_cleanup(struct nvgpu_device *dev) {
-  if (dev->numa_node0_kobj) {
-    sysfs_remove_group(dev->numa_node0_kobj, &nvgpu_node0_group);
-    kobject_put(dev->numa_node0_kobj);
-    dev->numa_node0_kobj = NULL;
-  }
-  if (dev->numa_node_kobj) {
-    kobject_put(dev->numa_node_kobj);
-    dev->numa_node_kobj = NULL;
-  }
-}
-
 /* ───────── DRI device nodes (host major:minor passthrough) ─────────────── */
-/*
- * The host has /dev/dri/card1 and /dev/dri/renderD128.
- * The VMM finds which ones belong to the passed-through GPU (via sysfs
- * symlinks) and reports their real major:minor in the GET_SYS_FILES response.
- * We register character devices with those exact numbers so the guest sees
- * the same /dev/dri/ layout.
- */
-
-static struct class *nvgpu_drm_class;
 
 static int nvgpu_dri_open(struct inode *inode, struct file *filp) {
-  /* Delegate to GPU 0's open path */
-  return nvgpu_open_common(inode, filp, 0);
+  struct nvgpu_dri_dev *dri =
+      container_of(inode->i_cdev, struct nvgpu_dri_dev, cdev);
+  struct nvgpu_device *dev = dri->dev;
+  struct nvgpu_fd *nfd = NULL;
+  struct nvgpu_open_req *req = NULL;
+  struct nvgpu_open_resp *resp = NULL;
+  int ret;
+
+  if (!dev)
+    return -ENODEV;
+
+  nfd = kzalloc(sizeof(*nfd), GFP_KERNEL);
+  req = kzalloc(sizeof(*req), GFP_KERNEL);
+  resp = kzalloc(sizeof(*resp), GFP_KERNEL);
+  if (!nfd || !req || !resp) {
+    ret = -ENOMEM;
+    goto err;
+  }
+
+  nfd->dev = dev;
+  nfd->device_type = NVGPU_DEV_DRI_BASE + dri->index;
+
+  req->hdr.msg_type = cpu_to_le32(NVGPU_MSG_OPEN);
+  req->hdr.handle = 0;
+  req->hdr.status = 0;
+  req->hdr.padding = 0;
+  req->device_type = cpu_to_le32(NVGPU_DEV_DRI_BASE + dri->index);
+  req->flags = cpu_to_le32(filp->f_flags);
+
+  ret = nvgpu_send_recv(dev, req, sizeof(*req), resp, sizeof(*resp));
+  if (ret < 0)
+    goto err;
+
+  if ((s32)le32_to_cpu((__le32)resp->hdr.status) < 0) {
+    ret = (s32)le32_to_cpu((__le32)resp->hdr.status);
+    goto err;
+  }
+
+  nfd->handle = le32_to_cpu(resp->hdr.handle);
+  filp->private_data = nfd;
+  kfree(req);
+  kfree(resp);
+  return 0;
+
+err:
+  kfree(nfd);
+  kfree(req);
+  kfree(resp);
+  return ret;
 }
 
 static const struct file_operations nvgpu_dri_fops = {
     .owner = THIS_MODULE,
     .open = nvgpu_dri_open,
     .release = nvgpu_release,
-    .unlocked_ioctl = nvgpu_ioctl,
+    .unlocked_ioctl = nvgpu_dri_ioctl,
     .mmap = nvgpu_mmap,
 };
 
@@ -1317,6 +1669,8 @@ static char *nvgpu_devnode(const struct device *dev, umode_t *mode) {
   return NULL;
 }
 
+static struct class *nvgpu_dri_class;
+
 static char *nvgpu_dri_devnode(const struct device *dev, umode_t *mode) {
   if (mode)
     *mode = 0666;
@@ -1325,33 +1679,29 @@ static char *nvgpu_dri_devnode(const struct device *dev, umode_t *mode) {
 
 static int nvgpu_dri_init(struct nvgpu_device *dev) {
   int i;
-  struct class *drm_cls;
 
-  if (dev->num_dri_devs == 0)
+  if (dev->num_dri_devs == 0) {
+    dev_info(&dev->vdev->dev,
+             "virtio-gpu-nv: no DRI devices reported by VMM\n");
     return 0;
-
-  /*
-   * drm_virtio never ran (no standard virtio-gpu device exposed by VMM),
-   * so /sys/class/drm was never created. We need it for udev to create
-   * /dev/dri/ nodes. Create it here if absent; if DRM core already made
-   * it, class_create returns ERR_PTR(-EEXIST) and we just move on without
-   * owning it.
-   */
-  drm_cls = class_create("drm");
-  if (IS_ERR(drm_cls)) {
-    /* Already exists — DRM core owns it, we don't */
-    nvgpu_drm_class = NULL;
-    dev_info(&dev->vdev->dev, "virtio-gpu-nv: drm class already exists\n");
-  } else {
-    /* We created it — we own it, must destroy on remove */
-    nvgpu_drm_class = drm_cls;
-    nvgpu_drm_class->devnode = nvgpu_dri_devnode;
-    dev_info(&dev->vdev->dev, "virtio-gpu-nv: created drm class\n");
   }
+
+  nvgpu_dri_class = class_create("nvgpu_dri");
+  if (IS_ERR(nvgpu_dri_class)) {
+    dev_err(&dev->vdev->dev, "virtio-gpu-nv: failed to create dri class: %ld\n",
+            PTR_ERR(nvgpu_dri_class));
+    nvgpu_dri_class = NULL;
+    return PTR_ERR(nvgpu_dri_class);
+  }
+  nvgpu_dri_class->devnode = nvgpu_dri_devnode;
 
   for (i = 0; i < dev->num_dri_devs; i++) {
     dev_t devno = MKDEV(dev->dri_devs[i].major, dev->dri_devs[i].minor);
 
+    dev->dri_devs[i].index = (u32)i;
+    dev->dri_devs[i].dev = dev;
+
+    /* ── Register the cdev at host major:minor ── */
     if (register_chrdev_region(devno, 1, dev->dri_devs[i].name) != 0) {
       dev_warn(&dev->vdev->dev, "virtio-gpu-nv: cannot reserve %s (%u:%u)\n",
                dev->dri_devs[i].name, dev->dri_devs[i].major,
@@ -1369,29 +1719,14 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
       continue;
     }
 
-    /*
-     * Only call device_create if we own the class OR if the class
-     * exists (borrowed). Either way udev needs the uevent.
-     */
-    {
-      struct class *cls = nvgpu_drm_class;
-      if (!cls) {
-        /*
-         * We don't own it but it exists — look it up.
-         * On 6.19 there's no exported class_find, so we
-         * just skip device_create and rely on the cdev
-         * being present. udev will find it via /sys/dev.
-         */
-      } else {
-        device_create(cls, &dev->vdev->dev, devno, dev, "%s",
-                      dev->dri_devs[i].name);
-      }
-    }
+    device_create(nvgpu_dri_class, &dev->vdev->dev, devno, NULL, "%s",
+                  dev->dri_devs[i].name);
 
     dev->dri_devs[i].registered = true;
-    dev_info(&dev->vdev->dev, "virtio-gpu-nv: registered /dev/dri/%s (%u:%u)\n",
+    dev_info(&dev->vdev->dev,
+             "virtio-gpu-nv: registered /dev/dri/%s (%u:%u) gpu_id=0x%x\n",
              dev->dri_devs[i].name, dev->dri_devs[i].major,
-             dev->dri_devs[i].minor);
+             dev->dri_devs[i].minor, dev->dri_devs[i].gpu_id);
   }
 
   return 0;
@@ -1401,54 +1736,191 @@ static void nvgpu_dri_cleanup(struct nvgpu_device *dev) {
   int i;
 
   for (i = 0; i < dev->num_dri_devs; i++) {
-    if (!dev->dri_devs[i].registered)
+    struct nvgpu_dri_dev *dri = &dev->dri_devs[i];
+
+    if (!dri->registered)
       continue;
 
-    if (nvgpu_drm_class)
-      device_destroy(nvgpu_drm_class,
-                     MKDEV(dev->dri_devs[i].major, dev->dri_devs[i].minor));
-
-    cdev_del(&dev->dri_devs[i].cdev);
-    unregister_chrdev_region(
-        MKDEV(dev->dri_devs[i].major, dev->dri_devs[i].minor), 1);
-    dev->dri_devs[i].registered = false;
+    device_destroy(nvgpu_dri_class, MKDEV(dri->major, dri->minor));
+    cdev_del(&dri->cdev);
+    unregister_chrdev_region(MKDEV(dri->major, dri->minor), 1);
+    dri->registered = false;
   }
 
-  /* Only destroy class if WE created it */
-  if (nvgpu_drm_class) {
-    class_destroy(nvgpu_drm_class);
-    nvgpu_drm_class = NULL;
+  if (nvgpu_dri_class) {
+    class_destroy(nvgpu_dri_class);
+    nvgpu_dri_class = NULL;
+  }
+}
+
+/* --- SYSTEM BUS PCI DEVS --- */
+
+static int nvgpu_pci_read(struct pci_bus *bus, unsigned int devfn, int where,
+                          int size, u32 *val) {
+  struct nvgpu_pci_root *root = bus->sysdata;
+  u8 slot = PCI_SLOT(devfn);
+  u8 func = PCI_FUNC(devfn);
+
+  /* Only respond to our specific device */
+  if (slot != root->slot.slot || func != root->slot.func) {
+    *val = ~0u;
+    return PCIBIOS_DEVICE_NOT_FOUND;
+  }
+
+  if (!root->slot.config_valid || where + size > 256) {
+    *val = ~0u;
+    return PCIBIOS_BAD_REGISTER_NUMBER;
+  }
+
+  switch (size) {
+  case 1:
+    *val = root->slot.config[where];
+    break;
+  case 2:
+    *val = le16_to_cpu(*(u16 *)&root->slot.config[where]);
+    break;
+  case 4:
+    *val = le32_to_cpu(*(u32 *)&root->slot.config[where]);
+    break;
+  default:
+    *val = ~0u;
+    return PCIBIOS_BAD_REGISTER_NUMBER;
+  }
+  return PCIBIOS_SUCCESSFUL;
+}
+
+static int nvgpu_pci_write(struct pci_bus *bus, unsigned int devfn, int where,
+                           int size, u32 val) {
+  /* Config space is read-only from guest perspective */
+  return PCIBIOS_FUNC_NOT_SUPPORTED;
+}
+
+static struct pci_ops nvgpu_pci_ops = {
+    .read = nvgpu_pci_read,
+    .write = nvgpu_pci_write,
+};
+
+/* Parse "DDDD:BB:SS.F" into components.
+ * Returns 0 on success. */
+static int nvgpu_parse_pci_addr(const char *addr, u16 *domain, u8 *bus,
+                                u8 *slot, u8 *func) {
+  unsigned int d, b, s, f;
+
+  if (sscanf(addr, "%04x:%02x:%02x.%1x", &d, &b, &s, &f) != 4)
+    return -EINVAL;
+
+  *domain = (u16)d;
+  *bus = (u8)b;
+  *slot = (u8)s;
+  *func = (u8)f;
+  return 0;
+}
+
+static int nvgpu_pci_init(struct nvgpu_device *dev) {
+  int i, ret = 0;
+
+  for (i = 0; i < dev->num_pci_roots; i++) {
+    struct nvgpu_pci_root *root = &dev->pci_roots[i];
+    struct pci_host_bridge *bridge;
+    struct resource *bus_res;
+
+    if (!root->slot.config_valid) {
+      dev_warn(&dev->vdev->dev,
+               "virtio-gpu-nv: no config space for %s, skipping\n",
+               root->slot.pci_addr);
+      continue;
+    }
+
+    bridge = pci_alloc_host_bridge(0);
+    if (!bridge) {
+      dev_err(&dev->vdev->dev,
+              "virtio-gpu-nv: pci_alloc_host_bridge failed for %s\n",
+              root->slot.pci_addr);
+      ret = -ENOMEM;
+      continue;
+    }
+
+    /* One bus resource covering exactly our bus number */
+    bus_res = kzalloc(sizeof(*bus_res), GFP_KERNEL);
+    if (!bus_res) {
+      pci_free_host_bridge(bridge);
+      ret = -ENOMEM;
+      continue;
+    }
+    bus_res->start = root->slot.bus_nr;
+    bus_res->end = root->slot.bus_nr;
+    bus_res->flags = IORESOURCE_BUS;
+    pci_add_resource(&bridge->windows, bus_res);
+
+    bridge->dev.parent = &dev->vdev->dev;
+    root->domain = (int)root->slot.domain;
+    bridge->sysdata = root;
+    bridge->ops = &nvgpu_pci_ops;
+    bridge->busnr = root->slot.bus_nr;
+    bridge->domain_nr = root->slot.domain; /* parsed u16, not ASCII bytes */
+    root->nvdev = dev;
+
+    ret = pci_scan_root_bus_bridge(bridge);
+    if (ret) {
+      dev_err(&dev->vdev->dev,
+              "virtio-gpu-nv: pci_scan_root_bus_bridge %s: %d\n",
+              root->slot.pci_addr, ret);
+      pci_free_host_bridge(bridge);
+      kfree(bus_res);
+      continue;
+    }
+
+    pci_bus_add_devices(bridge->bus);
+    root->bridge = bridge;
+    root->registered = true;
+
+    dev_info(&dev->vdev->dev, "virtio-gpu-nv: registered fake PCI device %s\n",
+             root->slot.pci_addr);
+  }
+
+  return ret;
+}
+
+static void nvgpu_pci_cleanup(struct nvgpu_device *dev) {
+  int i;
+
+  for (i = 0; i < dev->num_pci_roots; i++) {
+    struct nvgpu_pci_root *root = &dev->pci_roots[i];
+
+    if (!root->registered)
+      continue;
+
+    pci_remove_root_bus(root->bridge->bus);
+    /* pci_remove_root_bus frees the bridge */
+    root->bridge = NULL;
+    root->registered = false;
   }
 }
 
 /* ───────── GET_SYS_FILES handler (guest side) ──────────────────────────── */
-/*
- * Send NVGPU_MSG_GET_SYS_FILES to the VMM and process the response:
- *
- *   Section 1 — sysfs files:
- *     [path_len:u32][content_len:u32][path...][content...] ... [0][0]
- *   Section 2 — DRI devices:
- *     [num_dri:u32] then per device:
- * [name_len:u32][major:u32][minor:u32][name...]
- */
+
 static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
   struct nvgpu_msg_hdr *req;
   u8 *resp_buf;
   u8 *p, *end;
-  int resp_max = 128 * 1024; /* 128 KiB — plenty for a few sysfs files */
+  const int resp_max = 128 * 1024;
   int ret = 0;
 
   req = kzalloc(sizeof(*req), GFP_KERNEL);
   if (!req)
     return -ENOMEM;
 
-  resp_buf = kvmalloc(resp_max, GFP_KERNEL);
+  /* kvzalloc — zeroed so unwritten tail is never misread as data */
+  resp_buf = kvzalloc(resp_max, GFP_KERNEL);
   if (!resp_buf) {
     kfree(req);
     return -ENOMEM;
   }
 
   req->msg_type = cpu_to_le32(NVGPU_MSG_GET_SYS_FILES);
+  req->handle = 0;
+  req->status = 0;
+  req->padding = 0;
 
   ret = nvgpu_send_recv(dev, req, sizeof(*req), resp_buf, resp_max);
   if (ret < 0)
@@ -1459,81 +1931,154 @@ static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
 
   /* ── Section 1: sysfs files ─────────────────────────────────────── */
   while (p + 8 <= end) {
-    u32 path_len = le32_to_cpu(*(u32 *)p);
-    p += 4;
-    u32 content_len = le32_to_cpu(*(u32 *)p);
-    p += 4;
+    /* Fix: memcpy for unaligned u32 reads, matching nvgpu_proc_init style */
+    __le32 raw_path_len, raw_content_len;
+    u32 path_len, content_len, copy_len;
+    char path[256];
+
+    memcpy(&raw_path_len, p, sizeof(__le32));
+    memcpy(&raw_content_len, p + 4, sizeof(__le32));
+    path_len = le32_to_cpu(raw_path_len);
+    content_len = le32_to_cpu(raw_content_len);
+    p += 8;
 
     if (path_len == 0 && content_len == 0)
       break; /* terminator */
 
-    if (p + path_len + content_len > end)
+    if (p + path_len + content_len > end) {
+      dev_warn(&dev->vdev->dev,
+               "virtio-gpu-nv: sys stream truncated at sysfs section\n");
       break;
+    }
 
-    /* NUL-safe path extraction */
-    char path[256] = {};
-    u32 copy_len = min(path_len, (u32)(sizeof(path) - 1));
+    /* Safe path extraction — explicit memset, no {} initialiser */
+    memset(path, 0, sizeof(path));
+    copy_len = min(path_len, (u32)(sizeof(path) - 1));
     memcpy(path, p, copy_len);
     p += path_len;
 
-    /*
-     * Route by path suffix.  VMM sends paths relative to /sys/,
-     * e.g. "devices/system/node/node0/cpumap".
-     */
-    if (strstr(path, "node0/cpumap")) {
-      u32 l = min(content_len, (u32)sizeof(dev->numa_cpumap) - 1);
-      memcpy(dev->numa_cpumap, p, l);
-      dev->numa_cpumap[l] = '\0';
-    } else if (strstr(path, "node0/cpulist")) {
-      u32 l = min(content_len, (u32)sizeof(dev->numa_cpulist) - 1);
-      memcpy(dev->numa_cpulist, p, l);
-      dev->numa_cpulist[l] = '\0';
-    } else if (strstr(path, "node0/numastat")) {
-      u32 l = min(content_len, (u32)sizeof(dev->numa_numastat) - 1);
-      memcpy(dev->numa_numastat, p, l);
-      dev->numa_numastat[l] = '\0';
-    } else if (strstr(path, "node0/meminfo")) {
-      u32 l = min(content_len, (u32)sizeof(dev->numa_meminfo) - 1);
-      memcpy(dev->numa_meminfo, p, l);
-      dev->numa_meminfo[l] = '\0';
+    if (p + content_len > end) {
+      dev_warn(&dev->vdev->dev,
+               "virtio-gpu-nv: sys stream truncated at content\n");
+      break;
     }
-    /* Unknown paths are silently ignored */
+
+    if (strncmp(path, "bus/pci/devices/", 16) == 0) {
+      char *rest = path + 16; /* "<addr>/<filename>" */
+      char *slash = strchr(rest, '/');
+
+      if (slash && strcmp(slash + 1, "config") == 0) {
+        char pci_addr[16] = {};
+        int pi;
+
+        memcpy(pci_addr, rest,
+               min((size_t)(slash - rest), sizeof(pci_addr) - 1));
+
+        /* Find existing slot or allocate new one */
+        for (pi = 0; pi < dev->num_pci_roots; pi++)
+          if (strcmp(dev->pci_roots[pi].slot.pci_addr, pci_addr) == 0)
+            break;
+
+        /* Match against known GPU slots to avoid creating
+         * entries for unrelated PCI devices */
+        if (pi == dev->num_pci_roots) {
+          int gi;
+          for (gi = 0; gi < (int)dev->num_gpus; gi++) {
+            if (strcmp(dev->gpu_slots[gi].pci_addr, pci_addr) == 0) {
+              pi = dev->num_pci_roots;
+              if (pi < NVGPU_MAX_PCI_SLOTS) {
+                memcpy(dev->pci_roots[pi].slot.pci_addr, pci_addr,
+                       sizeof(pci_addr));
+                if (nvgpu_parse_pci_addr(pci_addr,
+                                         &dev->pci_roots[pi].slot.domain,
+                                         &dev->pci_roots[pi].slot.bus_nr,
+                                         &dev->pci_roots[pi].slot.slot,
+                                         &dev->pci_roots[pi].slot.func) == 0)
+                  dev->num_pci_roots++;
+                else
+                  pi = dev->num_pci_roots; /* parse failed */
+              }
+              break;
+            }
+          }
+        }
+
+        if (pi < dev->num_pci_roots) {
+          struct nvgpu_pci_slot *ps = &dev->pci_roots[pi].slot;
+          u32 copy = min(content_len, (u32)sizeof(ps->config));
+          memcpy(ps->config, p, copy);
+          ps->config_valid = true;
+          dev_dbg(&dev->vdev->dev,
+                  "virtio-gpu-nv: stored config space for %s (%u bytes)\n",
+                  pci_addr, copy);
+        }
+      }
+      /* Other PCI sysfs files (vendor, device, etc.) are handled
+       * automatically by the kernel once the pci_dev is registered */
+    }
+    /* Unknown paths silently skipped */
 
     p += content_len;
   }
 
   /* ── Section 2: DRI devices ─────────────────────────────────────── */
-  if (p + 4 > end)
+  if (p + 4 > end) {
+    dev_warn(&dev->vdev->dev,
+             "virtio-gpu-nv: sys stream truncated before DRI section\n");
     goto out;
+  }
 
   {
-    u32 num_dri = le32_to_cpu(*(u32 *)p);
+    __le32 raw_num_dri;
+    u32 num_dri, i;
+
+    memcpy(&raw_num_dri, p, sizeof(__le32));
+    num_dri = le32_to_cpu(raw_num_dri);
     p += 4;
 
     num_dri = min(num_dri, (u32)NVGPU_MAX_DRI_DEVS);
     dev->num_dri_devs = 0;
 
-    for (u32 i = 0; i < num_dri && p + 12 <= end; i++) {
-      u32 name_len = le32_to_cpu(*(u32 *)p);
-      p += 4;
-      u32 major = le32_to_cpu(*(u32 *)p);
-      p += 4;
-      u32 minor = le32_to_cpu(*(u32 *)p);
-      p += 4;
+    for (i = 0; i < num_dri; i++) {
+      __le32 raw_name_len, raw_major, raw_minor, raw_gpu_id;
+      u32 name_len, major, minor, gpu_id, nl;
+      int idx;
 
-      if (name_len == 0 || p + name_len > end)
+      /* 16 bytes: name_len + major + minor + gpu_id */
+      if (p + 16 > end) {
+        dev_warn(&dev->vdev->dev,
+                 "virtio-gpu-nv: DRI section truncated at entry %u\n", i);
         break;
+      }
 
-      int idx = dev->num_dri_devs;
-      u32 nl = min(name_len, (u32)(sizeof(dev->dri_devs[idx].name) - 1));
+      memcpy(&raw_name_len, p, sizeof(__le32));
+      memcpy(&raw_major, p + 4, sizeof(__le32));
+      memcpy(&raw_minor, p + 8, sizeof(__le32));
+      memcpy(&raw_gpu_id, p + 12, sizeof(__le32)); /* ← new */
+      name_len = le32_to_cpu(raw_name_len);
+      major = le32_to_cpu(raw_major);
+      minor = le32_to_cpu(raw_minor);
+      gpu_id = le32_to_cpu(raw_gpu_id); /* ← new */
+      p += 16;                          /* was 12 */
+
+      if (name_len == 0 || p + name_len > end) {
+        dev_warn(&dev->vdev->dev,
+                 "virtio-gpu-nv: DRI entry %u bad name_len %u\n", i, name_len);
+        break;
+      }
+
+      idx = dev->num_dri_devs;
+      nl = min(name_len, (u32)(sizeof(dev->dri_devs[idx].name) - 1));
+      memset(dev->dri_devs[idx].name, 0, sizeof(dev->dri_devs[idx].name));
       memcpy(dev->dri_devs[idx].name, p, nl);
-      dev->dri_devs[idx].name[nl] = '\0';
       dev->dri_devs[idx].major = major;
       dev->dri_devs[idx].minor = minor;
+      dev->dri_devs[idx].gpu_id = gpu_id; /* ← new */
       dev->num_dri_devs++;
 
-      dev_info(&dev->vdev->dev, "virtio-gpu-nv: DRI %s (%u:%u) from host\n",
-               dev->dri_devs[idx].name, major, minor);
+      dev_info(&dev->vdev->dev,
+               "virtio-gpu-nv: DRI %s (%u:%u) gpu_id=0x%x from host\n",
+               dev->dri_devs[idx].name, major, minor, gpu_id);
       p += name_len;
     }
   }
@@ -1542,6 +2087,104 @@ out:
   kvfree(resp_buf);
   kfree(req);
   return ret;
+}
+
+/* ───────── /sys/module/nvidia{,_uvm} initstate fakes ───────── */
+
+static struct kobject *nvgpu_module_kobj;     /* /sys/module/nvidia     */
+static struct kobject *nvgpu_uvm_module_kobj; /* /sys/module/nvidia_uvm */
+
+static ssize_t initstate_show(struct kobject *kobj, struct kobj_attribute *attr,
+                              char *buf) {
+  return sysfs_emit(buf, "live\n");
+}
+
+static struct kobj_attribute initstate_attr = __ATTR_RO(initstate);
+
+static void nvgpu_module_sysfs_init(struct nvgpu_device *dev) {
+  struct kobject *modules_kobj;
+
+  /* /sys/module/ is the parent of all module kobjects */
+  modules_kobj = kset_find_obj(module_kset, "nvidia");
+  if (modules_kobj) {
+    /* nvidia.ko already loaded somehow — don't duplicate */
+    kobject_put(modules_kobj);
+    return;
+  }
+
+  nvgpu_module_kobj = kobject_create_and_add("nvidia", &module_kset->kobj);
+  if (!nvgpu_module_kobj) {
+    dev_warn(&dev->vdev->dev,
+             "virtio-gpu-nv: failed to create /sys/module/nvidia\n");
+    return;
+  }
+  if (sysfs_create_file(nvgpu_module_kobj, &initstate_attr.attr))
+    dev_warn(&dev->vdev->dev, "virtio-gpu-nv: failed initstate under nvidia\n");
+
+  nvgpu_uvm_module_kobj =
+      kobject_create_and_add("nvidia_uvm", &module_kset->kobj);
+  if (!nvgpu_uvm_module_kobj) {
+    dev_warn(&dev->vdev->dev,
+             "virtio-gpu-nv: failed to create /sys/module/nvidia_uvm\n");
+    return;
+  }
+  if (sysfs_create_file(nvgpu_uvm_module_kobj, &initstate_attr.attr))
+    dev_warn(&dev->vdev->dev,
+             "virtio-gpu-nv: failed initstate under nvidia_uvm\n");
+
+  dev_info(&dev->vdev->dev,
+           "virtio-gpu-nv: created /sys/module/nvidia{,_uvm}/initstate\n");
+}
+
+static void nvgpu_module_sysfs_cleanup(void) {
+  if (nvgpu_uvm_module_kobj) {
+    sysfs_remove_file(nvgpu_uvm_module_kobj, &initstate_attr.attr);
+    kobject_put(nvgpu_uvm_module_kobj);
+    nvgpu_uvm_module_kobj = NULL;
+  }
+  if (nvgpu_module_kobj) {
+    sysfs_remove_file(nvgpu_module_kobj, &initstate_attr.attr);
+    kobject_put(nvgpu_module_kobj);
+    nvgpu_module_kobj = NULL;
+  }
+}
+
+/* ── nvidia-caps fops — proxy to host like everything else ── */
+
+static int nvgpu_caps_open(struct inode *inode, struct file *filp) {
+  /* caps devices are read-only capability checks.
+   * NVIDIA userspace opens them, does a few ioctls, closes.
+   * For now return success with a NULL private_data —
+   * if actual ioctls are needed we'll add VMM proxying. */
+  filp->private_data = NULL;
+  return 0;
+}
+
+static int nvgpu_caps_release(struct inode *inode, struct file *filp) {
+  return 0;
+}
+
+static long nvgpu_caps_ioctl(struct file *filp, unsigned int cmd,
+                             unsigned long arg) {
+  /* Most caps ioctls just query capability bits.
+   * Return 0 (success) — tells userspace "no special capabilities"
+   * which is correct for a non-MIG single GPU. */
+  return 0;
+}
+
+static const struct file_operations nvgpu_caps_fops = {
+    .owner = THIS_MODULE,
+    .open = nvgpu_caps_open,
+    .release = nvgpu_caps_release,
+    .unlocked_ioctl = nvgpu_caps_ioctl,
+};
+
+static struct class *nvgpu_caps_class;
+
+static char *nvgpu_caps_devnode(const struct device *dev, umode_t *mode) {
+  if (mode)
+    *mode = 0444;
+  return kasprintf(GFP_KERNEL, "nvidia-caps/%s", dev_name(dev));
 }
 
 /* ───────── Probe / remove ───────── */
@@ -1659,11 +2302,13 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   ret = cdev_add(&dev->cdev_ctl, MKDEV(NV_MAJOR, NV_CTL_MINOR), 1);
   if (ret)
     goto err_ctl_region;
+
   device_create(nvgpu_class, &vdev->dev, MKDEV(NV_MAJOR, NV_CTL_MINOR), NULL,
                 "nvidiactl");
 
-  /* Register /dev/nvidia-uvm (dynamic major) */
-  ret = alloc_chrdev_region(&dev->uvm_devno, 0, 2, "nvidia-uvm");
+  /* Register /dev/nvidia-uvm (major should match host) */
+  dev->uvm_devno = MKDEV(NV_UVM_MAJOR, 0);
+  ret = register_chrdev_region(dev->uvm_devno, 2, "nvidia-uvm");
   if (ret)
     goto err_ctl_cdev;
 
@@ -1674,24 +2319,51 @@ static int nvgpu_probe(struct virtio_device *vdev) {
     goto err_uvm_region;
 
   device_create(nvgpu_class, &vdev->dev, dev->uvm_devno, NULL, "nvidia-uvm");
-  device_create(nvgpu_class, &vdev->dev, MKDEV(MAJOR(dev->uvm_devno), 1), NULL,
+  device_create(nvgpu_class, &vdev->dev, MKDEV(NV_UVM_MAJOR, 1), NULL,
                 "nvidia-uvm-tools");
+
+  /* Register /dev/nvidia-caps/nvidia-cap{1,2} */
+  dev->caps_devno = MKDEV(NV_CAPS_MAJOR, 1);
+  ret = register_chrdev_region(dev->caps_devno, 2, "nvidia-caps");
+  if (ret) {
+    dev_warn(&vdev->dev, "virtio-gpu-nv: cannot register nvidia-caps: %d\n",
+             ret);
+    /* non-fatal — continue without caps */
+  } else {
+    nvgpu_caps_class = class_create("nvidia-caps");
+    if (!IS_ERR(nvgpu_caps_class)) {
+      nvgpu_caps_class->devnode = nvgpu_caps_devnode;
+
+      cdev_init(&dev->cdev_caps, &nvgpu_caps_fops);
+      dev->cdev_caps.owner = THIS_MODULE;
+      if (cdev_add(&dev->cdev_caps, MKDEV(NV_CAPS_MAJOR, 1), 2) == 0) {
+        device_create(nvgpu_caps_class, &vdev->dev, MKDEV(NV_CAPS_MAJOR, 1),
+                      NULL, "nvidia-cap1");
+        device_create(nvgpu_caps_class, &vdev->dev, MKDEV(NV_CAPS_MAJOR, 2),
+                      NULL, "nvidia-cap2");
+        dev_info(
+            &vdev->dev,
+            "virtio-gpu-nv: registered /dev/nvidia-caps/nvidia-cap{1,2}\n");
+      }
+    }
+  }
 
   /* Create /proc/driver/nvidia/version */
   ret = nvgpu_proc_init(dev);
   if (ret)
     goto err_uvm_cdev;
 
-  /* Set global pointer before creating sysfs/DRI (show callbacks need it) */
-  g_nvgpu_dev = dev;
-
   /* Fetch host sysfs content + DRI device list from the VMM */
   ret = nvgpu_fetch_sys_files(dev);
   if (ret)
     dev_warn(&vdev->dev, "virtio-gpu-nv: GET_SYS_FILES failed: %d\n", ret);
 
-  /* Create /sys/devices/system/node/node0 with real host cpumap/cpulist */
-  nvgpu_numa_init(dev); /* non-fatal */
+  /* Register fake PCI devices — creates /sys/bus/pci/devices/<addr>/ */
+  ret = nvgpu_pci_init(dev);
+  if (ret)
+    dev_warn(&vdev->dev, "virtio-gpu-nv: PCI sysfs init failed: %d\n", ret);
+
+  nvgpu_module_sysfs_init(dev);
 
   /* Create /dev/dri/renderD128 etc. with host major:minor */
   nvgpu_dri_init(dev); /* non-fatal */
@@ -1727,8 +2399,8 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   vdev->config->reset(vdev);
 
   nvgpu_dri_cleanup(dev);
-  nvgpu_numa_cleanup(dev);
-  g_nvgpu_dev = NULL;
+  nvgpu_module_sysfs_cleanup();
+  nvgpu_pci_cleanup(dev);
 
   for (i = 0; i < (int)dev->num_gpus; i++) {
     device_destroy(nvgpu_class, MKDEV(NV_MAJOR, i));
@@ -1741,9 +2413,19 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   unregister_chrdev_region(MKDEV(NV_MAJOR, NV_CTL_MINOR), 1);
 
   device_destroy(nvgpu_class, dev->uvm_devno);
-  device_destroy(nvgpu_class, MKDEV(MAJOR(dev->uvm_devno), 1));
+  device_destroy(nvgpu_class, MKDEV(NV_UVM_MAJOR, 1));
   cdev_del(&dev->cdev_uvm);
   unregister_chrdev_region(dev->uvm_devno, 2);
+
+  /* nvidia-caps cleanup */
+  if (nvgpu_caps_class) {
+    device_destroy(nvgpu_caps_class, MKDEV(NV_CAPS_MAJOR, 1));
+    device_destroy(nvgpu_caps_class, MKDEV(NV_CAPS_MAJOR, 2));
+    cdev_del(&dev->cdev_caps);
+    unregister_chrdev_region(MKDEV(NV_CAPS_MAJOR, 1), 2);
+    class_destroy(nvgpu_caps_class);
+    nvgpu_caps_class = NULL;
+  }
 
   if (nvgpu_class) {
     class_destroy(nvgpu_class);

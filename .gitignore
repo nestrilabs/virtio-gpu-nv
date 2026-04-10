@@ -6,3 +6,5 @@ kernel.c
 vmlinux
 /tarballs
 /linux-*
+.idea/
+.vscode/

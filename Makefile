@@ -91,26 +91,6 @@ $(KERNEL_C_BUNDLE): $(KERNEL_BINARY_$(GUESTARCH))
 	@python3 bin2cbundle.py -t $(KBUNDLE_TYPE_$(GUESTARCH)) $(KERNEL_BINARY_$(GUESTARCH)) kernel.c
 endif
 
-ifeq ($(SEV),1)
-$(QBOOT_C_BUNDLE): $(QBOOT_BINARY)
-	@echo "Generating $(QBOOT_C_BUNDLE) from $(QBOOT_BINARY)..."
-	@python3 bin2cbundle.py -t qboot $(QBOOT_BINARY) qboot.c
-
-$(INITRD_C_BUNDLE): $(INITRD_BINARY)
-	@echo "Generating $(INITRD_C_BUNDLE) from $(INITRD_BINARY)..."
-	@python3 bin2cbundle.py -t initrd $(INITRD_BINARY) initrd.c
-endif
-
-ifeq ($(TDX),1)
-$(QBOOT_C_BUNDLE): $(QBOOT_BINARY)
-	@echo "Generating $(QBOOT_C_BUNDLE) from $(QBOOT_BINARY)..."
-	@python3 bin2cbundle.py -t qboot $(QBOOT_BINARY) qboot.c
-
-$(INITRD_C_BUNDLE): $(INITRD_BINARY)
-	@echo "Generating $(INITRD_C_BUNDLE) from $(INITRD_BINARY)..."
-	@python3 bin2cbundle.py -t initrd $(INITRD_BINARY) initrd.c
-endif
-
 $(KRUNFW_BINARY_$(OS)): $(KERNEL_C_BUNDLE) $(QBOOT_C_BUNDLE) $(INITRD_C_BUNDLE)
 	$(CC) -fPIC -DABI_VERSION=$(ABI_VERSION) -shared $(SONAME_$(OS)) -o $@ $(KERNEL_C_BUNDLE) $(QBOOT_C_BUNDLE) $(INITRD_C_BUNDLE)
 ifeq ($(OS),Linux)
