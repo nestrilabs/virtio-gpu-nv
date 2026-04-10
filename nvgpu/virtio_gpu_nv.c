@@ -1316,26 +1316,16 @@ static char *nvgpu_devnode(const struct device *dev, umode_t *mode) {
 static int nvgpu_dri_init(struct nvgpu_device *dev) {
   int i;
 
-  if (dev->num_dri_devs == 0) {
-    dev_info(&dev->vdev->dev,
-             "virtio-gpu-nv: no DRI devices reported by VMM\n");
+  if (dev->num_dri_devs == 0)
     return 0;
-  }
 
   /*
-   * Create /sys/class/drm.  On a guest that has DRM compiled in this
-   * class already exists — class_create() will return ERR_PTR(-EEXIST).
-   * We record NULL in that case and skip device_create() calls (the
-   * class is already there from another driver).
+   * Never create the drm class ourselves — DRM core owns it.
+   * If it already exists we can use it; if not, we register
+   * the cdevs anyway (they work without a /sys/class entry).
+   * We do NOT call class_create("drm") at all.
    */
-  nvgpu_drm_class = class_create("drm");
-  if (IS_ERR(nvgpu_drm_class)) {
-    dev_info(&dev->vdev->dev,
-             "virtio-gpu-nv: drm class exists, skip class_create\n");
-    nvgpu_drm_class = NULL;
-  } else {
-    nvgpu_drm_class->devnode = nvgpu_devnode;
-  }
+  nvgpu_drm_class = NULL; /* we never own it */
 
   for (i = 0; i < dev->num_dri_devs; i++) {
     dev_t devno = MKDEV(dev->dri_devs[i].major, dev->dri_devs[i].minor);
@@ -1357,10 +1347,6 @@ static int nvgpu_dri_init(struct nvgpu_device *dev) {
       continue;
     }
 
-    if (nvgpu_drm_class)
-      device_create(nvgpu_drm_class, &dev->vdev->dev, devno, dev, "%s",
-                    dev->dri_devs[i].name);
-
     dev->dri_devs[i].registered = true;
     dev_info(&dev->vdev->dev, "virtio-gpu-nv: registered /dev/dri/%s (%u:%u)\n",
              dev->dri_devs[i].name, dev->dri_devs[i].major,
@@ -1376,19 +1362,16 @@ static void nvgpu_dri_cleanup(struct nvgpu_device *dev) {
   for (i = 0; i < dev->num_dri_devs; i++) {
     if (!dev->dri_devs[i].registered)
       continue;
-    if (nvgpu_drm_class)
-      device_destroy(nvgpu_drm_class,
-                     MKDEV(dev->dri_devs[i].major, dev->dri_devs[i].minor));
+
+    /* Never call device_destroy — we never called device_create */
     cdev_del(&dev->dri_devs[i].cdev);
     unregister_chrdev_region(
         MKDEV(dev->dri_devs[i].major, dev->dri_devs[i].minor), 1);
     dev->dri_devs[i].registered = false;
   }
 
-  if (nvgpu_drm_class) {
-    class_destroy(nvgpu_drm_class);
-    nvgpu_drm_class = NULL;
-  }
+  /* nvgpu_drm_class is always NULL — we never owned it */
+  nvgpu_drm_class = NULL;
 }
 
 /* ───────── GET_SYS_FILES handler (guest side) ──────────────────────────── */
