@@ -8,7 +8,6 @@
 pub mod allowlist;
 pub mod device;
 pub mod handler;
-pub mod libs;
 pub mod mmap;
 pub mod version;
 pub mod virtio;
