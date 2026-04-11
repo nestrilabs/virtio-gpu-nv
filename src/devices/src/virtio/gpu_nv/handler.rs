@@ -208,6 +208,12 @@ impl Worker {
             );
         }
 
+        // NV_ESC_SYS_PARAMS (0xD6) returns EBUSY on host when called from VMM context.
+        // Intercept and emulate. Struct is IoctlSysParams { MemblockSize: u64 }.
+        if nr == 0xd6 {
+            return self.handle_sys_params(&req, data);
+        }
+
         // Route to simple or complex path.
         // In handle_ioctl, replace the match arm:
         match nr {
@@ -221,6 +227,43 @@ impl Worker {
                 }
             }
         }
+    }
+
+    fn handle_sys_params(&mut self, req: &NvgpuIoctlReq, data: &[u8]) -> Vec<u8> {
+        let handle = req.hdr.handle;
+
+        // Validate size (expect 8 bytes: u64 MemblockSize)
+        if data.len() != 8 {
+            return self.error_response(handle, -libc::EINVAL);
+        }
+
+        // Prepare the response struct.
+        // MemblockSize is typically the huge page size (2MB) or page size (4KB).
+        // Returning 0x200000 (2MB) is a safe default for NVIDIA drivers.
+        let mut buf = data.to_vec();
+        let memblock_size: u64 = 0x200000; // 2 MB
+        buf[..8].copy_from_slice(&memblock_size.to_le_bytes());
+
+        log::debug!(
+            "virtio-gpu-nv: Emulated NV_ESC_SYS_PARAMS (0xd6) -> MemblockSize={}",
+            memblock_size
+        );
+
+        // Return success with the patched data
+        let resp_hdr = NvgpuIoctlResp {
+            hdr: NvgpuMsgHdr {
+                msg_type: NVGPU_MSG_IOCTL,
+                handle,
+                status: 0, // Success
+                padding: 0,
+            },
+            data_len: buf.len() as u32,
+            nested_len: 0,
+        };
+
+        let mut out = bytes_of(&resp_hdr);
+        out.extend_from_slice(&buf);
+        out
     }
 
     /// Generic handler for ioctls that carry a guest fd at a known payload offset.
@@ -396,8 +439,7 @@ impl Worker {
         if ioc_nr(req.cmd) == NV_ESC_RM_ALLOC {
             if top.len() >= RIGHTS_OFFSET + PTR_SIZE {
                 // pRightsRequested — null it out; we never pass access masks
-                top[RIGHTS_OFFSET..RIGHTS_OFFSET + PTR_SIZE]
-                    .copy_from_slice(&0u64.to_le_bytes());
+                top[RIGHTS_OFFSET..RIGHTS_OFFSET + PTR_SIZE].copy_from_slice(&0u64.to_le_bytes());
             }
         }
 
