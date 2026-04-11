@@ -12,3 +12,4 @@ init/init
 .idea/
 .vscode/
 *IMP*.md
+*.txt

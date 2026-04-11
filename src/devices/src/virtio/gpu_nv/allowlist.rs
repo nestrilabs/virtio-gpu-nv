@@ -72,9 +72,9 @@ impl AllowedIoctls {
             NV_IOCTL_BASE + 12, // NV_ESC_ATTACH_GPUS_TO_FD    0xD4
             NV_IOCTL_BASE + 13, // NV_ESC_QUERY_DEVICE_INTR    0xD5
             NV_IOCTL_BASE + 14, // NV_ESC_SYS_PARAMS           0xD6
-            NV_IOCTL_BASE + 15, // undocumented in 595.58.03   0xD7  ← ADD
-            NV_IOCTL_BASE + 16, // undocumented                0xD8  ← ADD
-            NV_IOCTL_BASE + 17, // NV_ESC_EXPORT_TO_DMABUF_FD  0xD9  ← ADD
+            NV_IOCTL_BASE + 15, // undocumented in 595.58.03   0xD7
+            NV_IOCTL_BASE + 16, // undocumented                0xD8
+            NV_IOCTL_BASE + 17, // NV_ESC_EXPORT_TO_DMABUF_FD  0xD9
             NV_IOCTL_BASE + 18, // NV_ESC_WAIT_OPEN_COMPLETE   0xDA
         ];
         for &nr in base {
@@ -85,6 +85,8 @@ impl AllowedIoctls {
         if caps & NVGPU_CAP_GRAPHICS != 0 {
             a.frontend.insert(0x27); // NV_ESC_RM_ALLOC_CONTEXT_DMA2
             a.frontend.insert(0x41); // NV_ESC_RM_IDLE_CHANNELS
+            a.frontend.insert(0x34); // TODO: Write which one is this
+            a.frontend.insert(0x4a); // TODO: Write which one is this
             a.frontend.insert(0x57); // NV_ESC_RM_MAP_MEMORY_DMA
             a.frontend.insert(0x58); // NV_ESC_RM_UNMAP_MEMORY_DMA
             a.frontend.insert(0x59); // NV_ESC_RM_BIND_CONTEXT_DMA
