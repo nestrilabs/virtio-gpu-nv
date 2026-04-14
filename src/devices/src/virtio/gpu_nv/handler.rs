@@ -17,6 +17,15 @@ use std::os::unix::io::AsRawFd;
 const NV_ESC_RM_CONTROL: u32 = 0x2a;
 const NV_ESC_RM_ALLOC: u32 = 0x2b;
 
+/// nvidia-modeset ioctls use type byte 0x6d ('m').
+/// Their outer struct is 16 bytes with a pointer at offset 8.
+const MODESET_IOC_TYPE: u32 = 0x6d;
+/// Byte offset of the embedded userspace pointer inside:
+///   - NVOS54/NVOS64 (RM_CONTROL/RM_ALLOC) outer structs: 16
+///   - nvidia-modeset outer struct {u32 cmd, u32 dataSize, u64 pData}: 8
+const PTR_OFFSET_RM: usize = 16;
+const PTR_OFFSET_MODESET: usize = 8;
+
 impl Worker {
     // ─────────────────────────────────────────────────────────────────────────
     // Top-level dispatcher
@@ -169,8 +178,11 @@ impl Worker {
             unsafe { std::ptr::read_unaligned(req_buf.as_ptr() as *const NvgpuIoctlReq) };
 
         // Security: reject unknown ioctl commands.
+        // Exception: nvidia-modeset ioctls (type 0x6d) always use nr=0;
+        // they are not in the frontend allowlist and must be checked by type.
         let nr = ioc_nr(req.cmd);
-        if !self.allowed_ioctls.is_allowed(nr) {
+        let ioc_type = (req.cmd >> 8) & 0xFF;
+        if ioc_type != MODESET_IOC_TYPE && !self.allowed_ioctls.is_allowed(nr) {
             log::debug!("virtio-gpu-nv: blocked ioctl nr=0x{:02x}", nr);
             return self.error_response(req.hdr.handle, -libc::ENOTTY);
         }
@@ -208,63 +220,69 @@ impl Worker {
             );
         }
 
-        // NV_ESC_SYS_PARAMS (0xD6) returns EBUSY on host when called from VMM context.
-        // Intercept and emulate. Struct is IoctlSysParams { MemblockSize: u64 }.
-        if nr == 0xd6 {
-            return self.handle_sys_params(&req, data);
-        }
+        // // NV_ESC_SYS_PARAMS (0xD6) returns EBUSY on host when called from VMM context.
+        // // Intercept and emulate. Struct is IoctlSysParams { MemblockSize: u64 }.
+        // if nr == 0xd6 {
+        //     return self.handle_sys_params(&req, data);
+        // }
 
         // Route to simple or complex path.
-        // In handle_ioctl, replace the match arm:
-        match nr {
-            NV_ESC_RM_CONTROL | NV_ESC_RM_ALLOC => self.execute_complex_ioctl(&req, data, nested),
-            _ => {
-                // Check fd-translation table before falling through to simple path.
-                if let Some(entry) = AllowedIoctls::fd_translation(nr) {
-                    self.execute_fd_translation_ioctl(&req, data, entry.payload_offset)
-                } else {
-                    self.execute_simple_ioctl(&req, data)
+        if ioc_type == MODESET_IOC_TYPE {
+            // nvidia-modeset (type 0x6d): 16-byte outer, pointer at offset 8
+            self.execute_complex_ioctl(&req, data, nested, PTR_OFFSET_MODESET)
+        } else {
+            match nr {
+                NV_ESC_RM_CONTROL | NV_ESC_RM_ALLOC => {
+                    self.execute_complex_ioctl(&req, data, nested, PTR_OFFSET_RM)
+                }
+                _ => {
+                    // Check fd-translation table before falling through to simple path.
+                    if let Some(entry) = AllowedIoctls::fd_translation(nr) {
+                        self.execute_fd_translation_ioctl(&req, data, entry.payload_offset)
+                    } else {
+                        self.execute_simple_ioctl(&req, data)
+                    }
                 }
             }
         }
     }
 
-    fn handle_sys_params(&mut self, req: &NvgpuIoctlReq, data: &[u8]) -> Vec<u8> {
-        let handle = req.hdr.handle;
+    // fn handle_sys_params(&mut self, req: &NvgpuIoctlReq, data: &[u8]) -> Vec<u8> {
+    //     let handle = req.hdr.handle;
 
-        // Validate size (expect 8 bytes: u64 MemblockSize)
-        if data.len() != 8 {
-            return self.error_response(handle, -libc::EINVAL);
-        }
+    //     // Validate size (expect 8 bytes: u64 MemblockSize)
+    //     if data.len() != 8 {
+    //         return self.error_response(handle, -libc::EINVAL);
+    //     }
 
-        // Prepare the response struct.
-        // MemblockSize is typically the huge page size (2MB) or page size (4KB).
-        // Returning 0x200000 (2MB) is a safe default for NVIDIA drivers.
-        let mut buf = data.to_vec();
-        let memblock_size: u64 = 0x200000; // 2 MB
-        buf[..8].copy_from_slice(&memblock_size.to_le_bytes());
+    //     // Prepare the response struct.
+    //     // MemblockSize is typically the huge page size (2MB) or page size (4KB).
+    //     // Returning 0x200000 (2MB) is a safe default for NVIDIA drivers.
+    //     let mut buf = data.to_vec();
+    //     let memblock_size: u64 = 0x200000; // 2 MB
+    //     buf[..8].copy_from_slice(&memblock_size.to_le_bytes());
 
-        log::debug!(
-            "virtio-gpu-nv: Emulated NV_ESC_SYS_PARAMS (0xd6) -> MemblockSize={}",
-            memblock_size
-        );
+    //     log::debug!(
+    //         "virtio-gpu-nv: Emulated NV_ESC_SYS_PARAMS (0xd6) -> MemblockSize={}",
+    //         memblock_size
+    //     );
 
-        // Return success with the patched data
-        let resp_hdr = NvgpuIoctlResp {
-            hdr: NvgpuMsgHdr {
-                msg_type: NVGPU_MSG_IOCTL,
-                handle,
-                status: 0, // Success
-                padding: 0,
-            },
-            data_len: buf.len() as u32,
-            nested_len: 0,
-        };
+    //     // Return success with the patched data
+    //     let resp_hdr = NvgpuIoctlResp {
+    //         hdr: NvgpuMsgHdr {
+    //             msg_type: NVGPU_MSG_IOCTL,
+    //             handle,
+    //             status: 0, // Success
+    //             padding: 0,
+    //         },
+    //         data_len: buf.len() as u32,
+    //         nested_len: 0,
+    //     };
 
-        let mut out = bytes_of(&resp_hdr);
-        out.extend_from_slice(&buf);
-        out
-    }
+    //     let mut out = bytes_of(&resp_hdr);
+    //     out.extend_from_slice(&buf);
+    //     out
+    // }
 
     /// Generic handler for ioctls that carry a guest fd at a known payload offset.
     /// Translates handle → host fd number, then forwards as a normal simple ioctl.
@@ -322,6 +340,19 @@ impl Worker {
 
     /// Issue the ioctl with a pre-built mutable buffer and return the response.
     fn execute_simple_ioctl_with_buf(&mut self, req: &NvgpuIoctlReq, mut buf: Vec<u8>) -> Vec<u8> {
+        let nr = ioc_nr(req.cmd);
+
+        // FIX(wanjohi): Does this work?
+        // Special handling: NV_ESC_SYS_PARAMS (0xd6) - try V2 if EBUSY
+        // Some sysparams ioctls return EBUSY when the device is busy
+        if nr == 0xd6 && buf.len() >= 4 {
+            // Try setting Cmd to V2 (2) if it looks like a query
+            // The first 4 bytes are typically cmd/size
+            if buf[0] == 0 {
+                buf[0] = 2; // Try V2
+            }
+        }
+
         let handle = req.hdr.handle;
         let host_fd = match self.fd_table.get(&handle) {
             Some(f) => f,
@@ -338,9 +369,14 @@ impl Worker {
 
         let errno = if ret < 0 { errno_val() } else { 0 };
 
-        let nr = ioc_nr(req.cmd);
-        if nr == 0xd7 || nr == 0xd6 {
-            log::error!(
+        // Debug logging for Vulkan-critical ioctls
+        let log_response = nr == 0xd2  // NV_ESC_CHECK_VERSION_STR
+                || nr == 0xc8  // NV_ESC_CARD_INFO
+                || nr == 0xd6  // NV_ESC_SYS_PARAMS
+                || nr == 0xd7; // NV_ESC_QUERY_DEVICE_INTR
+
+        if log_response {
+            log::info!(
                 "virtio-gpu-nv: nr=0x{:02x} ret={} errno={} first16={:02x?}",
                 nr,
                 ret,
@@ -348,8 +384,9 @@ impl Worker {
                 &buf[..buf.len().min(16)]
             );
         }
-        if std::env::var("NVGPU_LOG_IOCTLS").is_ok() && ioc_nr(req.cmd) == 0xc9 {
-            log::error!(
+
+        if std::env::var("NVGPU_LOG_IOCTLS").is_ok() && nr == 0xc9 {
+            log::warn!(
                 "virtio-gpu-nv: CARD_INFO/REGISTER_FD nr=0xc9 \
              ret={} errno={} buf={:02x?}",
                 ret,
@@ -386,18 +423,24 @@ impl Worker {
         self.execute_simple_ioctl_with_buf(req, data.to_vec())
     }
 
-    // ── Complex ioctl: NV_ESC_RM_CONTROL / NV_ESC_RM_ALLOC ──────────────────
+    // ── Complex ioctl: NV_ESC_RM_CONTROL / NV_ESC_RM_ALLOC / modeset ────────
     //
     // These carry embedded guest pointers that we must:
     //   1. Replace with a host pointer to our nested_buf.
     //   2. Execute the ioctl on the host fd.
     //   3. Restore the original guest pointer value before sending back.
+    //
+    // `ptr_offset` is the byte offset of the u64 pointer field within the
+    // top-level data buffer:
+    //   PTR_OFFSET_RM      (16) for RM_CONTROL / RM_ALLOC
+    //   PTR_OFFSET_MODESET  (8) for nvidia-modeset ioctls
 
     fn execute_complex_ioctl(
         &mut self,
         req: &NvgpuIoctlReq,
         data: &[u8],
         nested: &[u8],
+        ptr_offset: usize,
     ) -> Vec<u8> {
         let handle = req.hdr.handle;
         let host_fd = match self.fd_table.get(&handle) {
@@ -412,18 +455,15 @@ impl Worker {
         // Mutable copy of the nested buffer — will be modified in place.
         let mut nested_buf = nested.to_vec();
 
-        // Save original guest pointer bytes (to restore after the ioctl).
-        // Both structs have the pointer at byte offset 16 (after 4×u32 fields).
-        const PTR_OFFSET: usize = 16;
         const PTR_SIZE: usize = 8;
         const RIGHTS_OFFSET: usize = 24; // pRightsRequested in NVOS64 only
 
-        if top.len() < PTR_OFFSET + PTR_SIZE {
+        if top.len() < ptr_offset + PTR_SIZE {
             return self.error_response(req.hdr.handle, -libc::EINVAL);
         }
 
         let mut saved_guest_ptr = [0u8; PTR_SIZE];
-        saved_guest_ptr.copy_from_slice(&top[PTR_OFFSET..PTR_OFFSET + PTR_SIZE]);
+        saved_guest_ptr.copy_from_slice(&top[ptr_offset..ptr_offset + PTR_SIZE]);
 
         // Patch the pointer field with the address of our host buffer.
         let host_ptr_val: u64 = if nested_buf.is_empty() {
@@ -431,7 +471,7 @@ impl Worker {
         } else {
             nested_buf.as_mut_ptr() as u64
         };
-        top[PTR_OFFSET..PTR_OFFSET + PTR_SIZE].copy_from_slice(&host_ptr_val.to_ne_bytes());
+        top[ptr_offset..ptr_offset + PTR_SIZE].copy_from_slice(&host_ptr_val.to_ne_bytes());
 
         // After patching pAllocParms/params pointer, also zero pRightsRequested
         // for RM_ALLOC (NVOS64). For RM_CONTROL (NVOS54) offset 24 is paramsSize
@@ -454,7 +494,7 @@ impl Worker {
 
         // Restore the original guest pointer so the guest driver can use it
         // for copy_to_user.
-        top[PTR_OFFSET..PTR_OFFSET + PTR_SIZE].copy_from_slice(&saved_guest_ptr);
+        top[ptr_offset..ptr_offset + PTR_SIZE].copy_from_slice(&saved_guest_ptr);
 
         let resp_hdr = NvgpuIoctlResp {
             hdr: NvgpuMsgHdr {
