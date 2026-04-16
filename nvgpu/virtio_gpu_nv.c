@@ -32,9 +32,9 @@
 #include <linux/virtio_config.h>
 #include <linux/virtio_ids.h>
 
+#include "gen/nvgpu_rmalloc_classes.h"
+#include "gen/nvgpu_v1v2_rewrites.h"
 #include "nvgpu_rm_intercepts.h"
-#include "nvgpu_rmalloc_classes.h"
-#include "nvgpu_v1v2_rewrites.h"
 
 /* module_kset is exported from kernel/module/sysfs.c */
 extern struct kset *module_kset;
@@ -69,6 +69,7 @@ extern struct kset *module_kset;
 #define NVGPU_DEV_CTL 255
 #define NVGPU_DEV_UVM 256
 #define NVGPU_DEV_UVM_TOOLS 257
+#define NV_MODESET_MINOR 254
 #define NVGPU_DEV_MODESET 258
 
 /* capability bits */
@@ -274,7 +275,6 @@ struct nvgpu_device {
   dev_t caps_devno;          /* dynamic major for nvidia-caps */
   struct cdev cdev_modeset;  /* /dev/nvidia-modeset */
   dev_t modeset_devno;
-  bool modeset_registered;
 
   /* Config read from VMM */
   char driver_version[32];
@@ -1382,37 +1382,35 @@ static const struct file_operations nvgpu_uvm_fops = {
  * The VMM side already handles pointer patching at offset 8 (see handler.rs).
  */
 
-/* modeset outer struct layout */
-struct nvgpu_modeset_params {
+struct nvidia_modeset_outer {
   __le32 cmd;
-  __le32 dataSize;
-  __le64 pData;
-} __packed; /* 16 bytes */
+  __le32 dataSize; /* ← the nested buffer size! */
+  __le64 pData;    /* ← userspace pointer to nested params */
+};
 
-static long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
-                                void __user *uarg, unsigned int sz) {
-  struct nvgpu_modeset_params params;
-  void __user *user_data;
-  u32 data_size;
+static long nvgpu_modeset_ioctl(struct file *filp, unsigned int cmd,
+                                unsigned long arg) {
+  struct nvgpu_fd *nfd = filp->private_data;
+  void __user *uarg = (void __user *)arg;
+  struct nvidia_modeset_outer outer;
+  void __user *user_nested;
+  u32 nested_size;
   void *req_buf = NULL, *resp_buf = NULL;
   struct nvgpu_ioctl_req *req;
   struct nvgpu_ioctl_resp *resp;
   int req_total, resp_max, ret;
 
-  if (sz < sizeof(params))
-    return -EINVAL;
-
-  if (copy_from_user(&params, uarg, sizeof(params)))
+  if (copy_from_user(&outer, uarg, sizeof(outer)))
     return -EFAULT;
 
-  user_data = (void __user *)(unsigned long)le64_to_cpu(params.pData);
-  data_size = le32_to_cpu(params.dataSize);
+  user_nested = (void __user *)(unsigned long)le64_to_cpu(outer.pData);
+  nested_size = le32_to_cpu(outer.dataSize);
 
-  if (data_size > 512 * 1024) /* sanity cap */
+  if (nested_size > 1024 * 1024)
     return -EINVAL;
 
-  req_total = sizeof(*req) + sizeof(params) + data_size;
-  resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(params) + data_size;
+  req_total = sizeof(*req) + sizeof(outer) + nested_size;
+  resp_max = sizeof(struct nvgpu_ioctl_resp) + sizeof(outer) + nested_size;
 
   req_buf = kmalloc(req_total, GFP_KERNEL);
   resp_buf = kmalloc(resp_max, GFP_KERNEL);
@@ -1427,17 +1425,15 @@ static long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
   req->hdr.status = 0;
   req->hdr.padding = 0;
   req->cmd = cpu_to_le32(cmd);
-  req->data_len = cpu_to_le32(sizeof(params));
-  req->nested_offset = cpu_to_le32(sizeof(params));
-  req->nested_len = cpu_to_le32(data_size);
+  req->data_len = cpu_to_le32(sizeof(outer));
+  req->nested_offset = cpu_to_le32(sizeof(outer));
+  req->nested_len = cpu_to_le32(nested_size);
 
-  /* Copy outer struct (pData pointer kept for VMM to see data_size) */
-  memcpy(req_buf + sizeof(*req), &params, sizeof(params));
+  memcpy(req_buf + sizeof(*req), &outer, sizeof(outer));
 
-  /* Copy the data buffer pointed to by pData */
-  if (user_data && data_size > 0) {
-    if (copy_from_user(req_buf + sizeof(*req) + sizeof(params), user_data,
-                       data_size)) {
+  if (user_nested && nested_size > 0) {
+    if (copy_from_user(req_buf + sizeof(*req) + sizeof(outer), user_nested,
+                       nested_size)) {
       ret = -EFAULT;
       goto out;
     }
@@ -1450,19 +1446,18 @@ static long nvgpu_ioctl_modeset(struct nvgpu_fd *nfd, unsigned int cmd,
   resp = (struct nvgpu_ioctl_resp *)resp_buf;
   ret = (int)(s32)le32_to_cpu((__le32)resp->hdr.status);
 
-  /* Copy modified outer struct back */
-  if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(params))) {
+  /* Write back outer struct */
+  if (copy_to_user(uarg, resp_buf + sizeof(*resp), sizeof(outer))) {
     ret = -EFAULT;
     goto out;
   }
 
-  /* Copy modified data back to the original userspace pointer */
-  if (user_data && le32_to_cpu(resp->nested_len) > 0) {
-    u32 copy_back = min(data_size, le32_to_cpu(resp->nested_len));
-    if (copy_to_user(user_data, resp_buf + sizeof(*resp) + sizeof(params),
-                     copy_back)) {
+  /* Write back nested params */
+  if (user_nested && le32_to_cpu(resp->nested_len) > 0) {
+    u32 copy_back = min(nested_size, le32_to_cpu(resp->nested_len));
+    if (copy_to_user(user_nested, resp_buf + sizeof(*resp) + sizeof(outer),
+                     copy_back))
       ret = -EFAULT;
-    }
   }
 
 out:
@@ -2577,6 +2572,24 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   device_create(nvgpu_class, &vdev->dev, MKDEV(NV_UVM_MAJOR, 1), NULL,
                 "nvidia-uvm-tools");
 
+  /* Register /dev/nvidia-modeset (match host, major 195, minor 254) */
+  dev->modeset_devno = MKDEV(NV_MAJOR, NV_MODESET_MINOR);
+  ret = register_chrdev_region(dev->modeset_devno, 1, "nvidia-modeset");
+  if (ret)
+    goto err_gpu_modeset;
+
+  cdev_init(&dev->cdev_modeset, &nvgpu_modeset_fops);
+  dev->cdev_modeset.owner = THIS_MODULE;
+  ret = cdev_add(&dev->cdev_modeset, dev->modeset_devno, 1);
+  if (ret)
+    goto err_gpu_modeset;
+
+  device_create(nvgpu_class, &vdev->dev, dev->modeset_devno, NULL,
+                "nvidia-modeset");
+  dev_info(&vdev->dev,
+           "virtio-gpu-nv: registered /dev/nvidia-modeset (%u:%u)\n",
+           MAJOR(dev->modeset_devno), MINOR(dev->modeset_devno));
+
   /* Register /dev/nvidia-caps/nvidia-cap{1,2} */
   dev->caps_devno = MKDEV(NV_CAPS_MAJOR, 1);
   ret = register_chrdev_region(dev->caps_devno, 2, "nvidia-caps");
@@ -2608,33 +2621,6 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   if (ret)
     goto err_uvm_cdev;
 
-  /* Register /dev/nvidia-modeset (dynamic major, minor 254) */
-  {
-    dev_t ms_devno;
-    // TODO(wanjohi): Get this major from a hardcoded value, like the rest of
-    // the devices ??
-    ret = alloc_chrdev_region(&ms_devno, 254, 1, "nvidia-modeset");
-    if (ret) {
-      dev_warn(&vdev->dev,
-               "virtio-gpu-nv: cannot register nvidia-modeset: %d\n", ret);
-      /* non-fatal */
-    } else {
-      cdev_init(&dev->cdev_modeset, &nvgpu_modeset_fops);
-      dev->cdev_modeset.owner = THIS_MODULE;
-      if (cdev_add(&dev->cdev_modeset, ms_devno, 1) == 0) {
-        device_create(nvgpu_class, &vdev->dev, ms_devno, NULL,
-                      "nvidia-modeset");
-        dev->modeset_devno = ms_devno;
-        dev->modeset_registered = true;
-        dev_info(&vdev->dev,
-                 "virtio-gpu-nv: registered /dev/nvidia-modeset (%u:%u)\n",
-                 MAJOR(ms_devno), MINOR(ms_devno));
-      } else {
-        unregister_chrdev_region(ms_devno, 1);
-      }
-    }
-  }
-
   /* Fetch host sysfs content + DRI device list from the VMM */
   ret = nvgpu_fetch_sys_files(dev);
   if (ret)
@@ -2654,6 +2640,8 @@ static int nvgpu_probe(struct virtio_device *vdev) {
            dev->driver_version);
   return 0;
 
+err_gpu_modeset:
+  unregister_chrdev_region(dev->modeset_devno, 1);
 err_uvm_region:
   unregister_chrdev_region(dev->uvm_devno, 2);
 err_uvm_cdev:
@@ -2684,13 +2672,9 @@ static void nvgpu_remove(struct virtio_device *vdev) {
   nvgpu_module_sysfs_cleanup();
   nvgpu_pci_cleanup(dev);
 
-  /* nvidia-modeset */
-  if (dev->modeset_registered) {
-    device_destroy(nvgpu_class, dev->modeset_devno);
-    cdev_del(&dev->cdev_modeset);
-    unregister_chrdev_region(dev->modeset_devno, 1);
-    dev->modeset_registered = false;
-  }
+  device_destroy(nvgpu_class, dev->modeset_devno);
+  cdev_del(&dev->cdev_modeset);
+  unregister_chrdev_region(dev->modeset_devno, 1);
 
   for (i = 0; i < (int)dev->num_gpus; i++) {
     device_destroy(nvgpu_class, MKDEV(NV_MAJOR, i));

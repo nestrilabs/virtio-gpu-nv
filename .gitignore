@@ -8,3 +8,6 @@ vmlinux
 /linux-*
 .idea/
 .vscode/
+nvgpu_gen_probe.c
+nvgpu_gen_probe_v1v2.c
+multi_pointer_commands.txt

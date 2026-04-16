@@ -130,6 +130,43 @@ nvgpu_intercept_get_build_version(struct nvgpu_fd *nfd, void __user *uarg,
   return nvgpu_set_nvos54_status(uarg, 0);
 }
 
+/* ─── 0x00003d05: NV0000_CTRL_CMD_OS_GET_CAPS ─────────────────────
+ *
+ * Platform-specific caps query. V1 nested params (16 bytes):
+ *   offset  0: capsTblSize  (u32) — size of caps buffer
+ *   offset  4: pad          (u32)
+ *   offset  8: capsTbl      (u64) — userspace pointer to caps buffer
+ *
+ * The host RM can't dereference the guest's capsTbl pointer.
+ * Return a zeroed caps table = "no special OS capabilities",
+ * which is correct for a VM environment.
+ */
+static inline long nvgpu_intercept_os_get_caps(struct nvgpu_fd *nfd,
+                                               void __user *uarg,
+                                               void __user *user_nested,
+                                               u32 nested_size) {
+  u8 params[16];
+  u32 caps_tbl_size;
+  u64 caps_tbl_ptr;
+
+  if (!user_nested || nested_size < 16)
+    return -EINVAL;
+
+  if (copy_from_user(params, user_nested, 16))
+    return -EFAULT;
+
+  memcpy(&caps_tbl_size, &params[0], sizeof(u32));
+  memcpy(&caps_tbl_ptr, &params[8], sizeof(u64));
+
+  /* If pointer is non-NULL, zero out the userspace caps buffer */
+  if (caps_tbl_ptr && caps_tbl_size > 0) {
+    if (clear_user((void __user *)caps_tbl_ptr, caps_tbl_size))
+      return -EFAULT;
+  }
+
+  return nvgpu_set_nvos54_status(uarg, 0); /* NV_OK */
+}
+
 /* ─── Dispatch table ──────────────────────────────────────────────── */
 
 /*
@@ -157,6 +194,10 @@ nvgpu_try_intercept_rm_control(struct nvgpu_fd *nfd, u32 ctl_cmd,
      * case 0x20801210: GR_GET_CTX_BUFFER_INFO
      * case 0x90960103: SWINTR_GET_INFO
      */
+
+  case 0x00003d05: /* NV0000_CTRL_CMD_OS_GET_CAPS */
+    *ret = nvgpu_intercept_os_get_caps(nfd, uarg, user_nested, nested_size);
+    return true;
 
   default:
     return false;
